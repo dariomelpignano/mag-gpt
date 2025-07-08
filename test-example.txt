@@ -1,0 +1,18 @@
+This is a test file to demonstrate the file upload functionality in MAG-GPT.
+
+You can upload this file and ask questions about its content, or upload your own files like:
+- Code files (.js, .ts, .py, .html, etc.)
+- Text files (.txt, .md)
+- Data files (.json, .csv, .xml)
+- Configuration files (.config, .env)
+
+The AI will analyze the file content and provide helpful responses based on what you upload.
+
+Features of the file upload system:
+- Support for multiple file types
+- File size limit of 10MB per file
+- Automatic content extraction
+- File context included in conversations
+- Easy file management with remove functionality
+
+Try uploading this file and asking: "What is this file about?" or "What are the features mentioned in this file?" 
