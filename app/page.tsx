@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
-import { Send, Bot, User, Trash2, Copy, Check, Paperclip, ChevronDown, ChevronUp, FileText } from "lucide-react"
+import { Send, Bot, User, Trash2, Copy, Check, Paperclip, ChevronDown, ChevronUp, FileText, LogOut } from "lucide-react"
 import { FileUpload, UploadedFile } from "@/components/file-upload"
 import { ThemeToggle } from "@/components/theme-toggle"
 
@@ -17,11 +17,28 @@ export default function ChatApp() {
   const { messages, input, handleInputChange, setMessages } = useChat()
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
+  const [userEmail, setUserEmail] = useState<string>("")
 
   // Debug log for uploaded files
   useEffect(() => {
     console.log('[PAGE] Uploaded files updated:', uploadedFiles.length, uploadedFiles.map(f => f.name))
   }, [uploadedFiles])
+
+  // Get user info on load
+  useEffect(() => {
+    const fetchUserInfo = async () => {
+      try {
+        const response = await fetch('/api/auth/me')
+        if (response.ok) {
+          const data = await response.json()
+          setUserEmail(data.user?.email || "")
+        }
+      } catch (error) {
+        console.error('Failed to get user info:', error)
+      }
+    }
+    fetchUserInfo()
+  }, [])
 
   // Funzione per aggiornare i file che supporta sia array che callback
   const updateUploadedFiles = (newFiles: UploadedFile[] | ((prev: UploadedFile[]) => UploadedFile[])) => {
@@ -50,6 +67,15 @@ export default function ChatApp() {
   const clearChat = () => {
     setMessages([])
     setUploadedFiles([])
+  }
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' })
+      window.location.reload() // Reload to trigger auth check
+    } catch (error) {
+      console.error('Logout failed:', error)
+    }
   }
 
   const copyToClipboard = async (text: string, messageId: string) => {
@@ -216,20 +242,37 @@ export default function ChatApp() {
               <p className="text-sm text-gray-500 dark:text-gray-400">Powered with love - v0.1.0</p>
             </div>
           </div>
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center space-x-3">
+            {/* User Info */}
+            <div className="hidden sm:flex items-center space-x-2 text-sm text-gray-600 dark:text-gray-300">
+              <User className="w-4 h-4" />
+              <span>{userEmail}</span>
+            </div>
+            
             <ThemeToggle />
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={clearChat}
+            
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={clearChat}
               disabled={(messages.length === 0 && uploadedFiles.length === 0) || isStreaming}
-            className="flex items-center space-x-2 bg-transparent"
-          >
-            <Trash2 className="w-4 h-4" />
-            <span>Clear Chat</span>
-          </Button>
+              className="flex items-center space-x-2 bg-transparent"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span className="hidden sm:inline">Clear Chat</span>
+            </Button>
+            
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleLogout}
+              className="flex items-center space-x-2 bg-transparent text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950"
+            >
+              <LogOut className="w-4 h-4" />
+              <span className="hidden sm:inline">Logout</span>
+            </Button>
+          </div>
         </div>
-      </div>
       </div>
 
       {/* Uploaded Files Panel - Collapsible */}
