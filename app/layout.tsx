@@ -16,9 +16,11 @@ export default function RootLayout({
 }) {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null)
   const [userEmail, setUserEmail] = useState<string>("")
+  const [mounted, setMounted] = useState(false)
 
   // Check authentication status on load
   useEffect(() => {
+    setMounted(true)
     checkAuth()
   }, [])
 
@@ -55,16 +57,16 @@ export default function RootLayout({
     }
   }
 
-  // Show loading state while checking authentication
-  if (isAuthenticated === null) {
+  // Show loading state while checking authentication or not mounted
+  if (!mounted || isAuthenticated === null) {
     return (
-      <html lang="en" className="h-full">
+      <html lang="en" className="h-full" suppressHydrationWarning>
         <head>
           <title>MAG-GPT - Powered by LM Studio</title>
           <meta name="description" content="A ChatGPT-like interface running locally with LM Studio" />
           <meta name="generator" content="v0.dev" />
         </head>
-        <body className={`${inter.className} h-full`}>
+        <body className={`${inter.className} h-full`} suppressHydrationWarning>
           <ThemeProvider
             attribute="class"
             defaultTheme="system"
@@ -87,12 +89,12 @@ export default function RootLayout({
   // Show login form if not authenticated
   if (!isAuthenticated) {
     return (
-      <html lang="en" className="h-full">
+      <html lang="en" className="h-full" suppressHydrationWarning>
         <head>
           <title>MAG-GPT - Login</title>
           <meta name="description" content="Login to MAG-GPT" />
         </head>
-        <body className={`${inter.className} h-full`}>
+        <body className={`${inter.className} h-full`} suppressHydrationWarning>
           <ThemeProvider
             attribute="class"
             defaultTheme="system"
@@ -109,13 +111,13 @@ export default function RootLayout({
 
   // Show main app if authenticated
   return (
-    <html lang="en" className="h-full">
+    <html lang="en" className="h-full" suppressHydrationWarning>
       <head>
         <title>MAG-GPT - Powered by LM Studio</title>
         <meta name="description" content="A ChatGPT-like interface running locally with LM Studio" />
         <meta name="generator" content="v0.dev" />
       </head>
-      <body className={`${inter.className} h-full`}>
+      <body className={`${inter.className} h-full`} suppressHydrationWarning>
         <ThemeProvider
           attribute="class"
           defaultTheme="system"
