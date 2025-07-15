@@ -47,6 +47,12 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
   const [isUploading, setIsUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [contextMode, setContextMode] = useState<'session' | 'context'>('session')
+  const [uploadProgress, setUploadProgress] = useState<{
+    fileName: string
+    currentPage: number
+    totalPages: number
+    status: string
+  } | null>(null)
 
   // Debug log for files prop
   useEffect(() => {
@@ -55,7 +61,7 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
 
   useEffect(() => {
     if (uploadError) {
-      const timer = setTimeout(() => setUploadError(null), 4000)
+      const timer = setTimeout(() => setUploadError(null), 6000) // Increased to 6 seconds
       return () => clearTimeout(timer)
     }
   }, [uploadError])
@@ -71,6 +77,7 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
 
     setIsUploading(true)
     setUploadError(null) // Clear previous errors
+    setUploadProgress(null) // Clear previous progress
 
     try {
       for (let i = 0; i < selectedFiles.length; i++) {
@@ -79,26 +86,61 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
         formData.append('file', file)
         formData.append('contextMode', contextMode)
 
-        const response = await fetch('/api/upload', {
-          method: 'POST',
-          body: formData,
-        })
+        // Set initial progress for large PDFs
+        if (file.type === 'application/pdf' && file.size > 10 * 1024 * 1024) { // 10MB+
+          setUploadProgress({
+            fileName: file.name,
+            currentPage: 0,
+            totalPages: 0,
+            status: 'Uploading large PDF...'
+          })
+        }
+
+        let response: Response
+        try {
+          response = await fetch('/api/upload', {
+            method: 'POST',
+            body: formData,
+          })
+        } catch (fetchError) {
+          console.error('Network error during upload:', fetchError)
+          throw new Error(`Network error: ${fetchError instanceof Error ? fetchError.message : 'Connection failed'}`)
+        }
+
+        let result: any
+        try {
+          // Check if response is JSON
+          const contentType = response.headers.get('content-type')
+          if (!contentType || !contentType.includes('application/json')) {
+            // Response is not JSON, likely an HTML error page
+            const textResponse = await response.text()
+            console.error('Non-JSON response received:', textResponse.substring(0, 500))
+            throw new Error('Server returned an HTML error page instead of JSON. This usually indicates a timeout or server error during processing.')
+          }
+          
+          result = await response.json()
+        } catch (parseError) {
+          console.error('Error parsing JSON response:', parseError)
+          if (parseError instanceof Error && parseError.message.includes('Unexpected token')) {
+            throw new Error('Server response was not valid JSON. The file processing may have timed out. Try uploading a smaller file or contact support.')
+          }
+          throw new Error(`Failed to parse server response: ${parseError instanceof Error ? parseError.message : 'Unknown parsing error'}`)
+        }
 
         if (!response.ok) {
-          const errorData = await response.json()
-          
-          // Se ci sono suggerimenti, mostrali nel messaggio di errore
-          let errorMessage = errorData.error || 'Upload failed'
-          if (errorData.suggestions && Array.isArray(errorData.suggestions)) {
-            errorMessage += '\n\nSuggerimenti:\n' + errorData.suggestions.map((s: string) => `• ${s}`).join('\n')
+          // Server returned an error
+          let errorMessage = result.error || 'Upload failed'
+          if (result.suggestions && Array.isArray(result.suggestions)) {
+            errorMessage += '\n\nSuggerimenti:\n' + result.suggestions.map((s: string) => `• ${s}`).join('\n')
           }
           
           throw new Error(errorMessage)
         }
-
-        const result = await response.json()
         
         if (result.success) {
+          // Clear progress when done
+          setUploadProgress(null)
+          
           if (contextMode === 'context' && result.contextSaved) {
             // For context files, trigger a page refresh to reload context files
             // Don't add to session state as it will be loaded via context refresh
@@ -134,6 +176,7 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
       console.error('Error uploading files:', error)
       const errorMessage = error instanceof Error ? error.message : 'Unknown error'
       setUploadError(errorMessage)
+      setUploadProgress(null) // Clear progress on error
     } finally {
       setIsUploading(false)
       // Reset input
@@ -198,6 +241,39 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
             >
               <X className="w-4 h-4" />
             </Button>
+          </div>
+        </Card>
+      )}
+
+      {/* Upload Progress Display */}
+      {uploadProgress && (
+        <Card className="p-3 border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950">
+          <div className="flex items-start space-x-2">
+            <div className="w-4 h-4 mt-0.5 flex-shrink-0">
+              <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+            </div>
+            <div className="flex-1">
+              <h4 className="text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
+                Elaborazione: {uploadProgress.fileName}
+              </h4>
+              <p className="text-xs text-blue-700 dark:text-blue-300 mb-2">
+                {uploadProgress.status}
+              </p>
+              {uploadProgress.totalPages > 0 && (
+                <div className="space-y-1">
+                  <div className="flex justify-between text-xs text-blue-600 dark:text-blue-400">
+                    <span>Pagina {uploadProgress.currentPage} di {uploadProgress.totalPages}</span>
+                    <span>{Math.round((uploadProgress.currentPage / uploadProgress.totalPages) * 100)}%</span>
+                  </div>
+                  <div className="w-full bg-blue-200 dark:bg-blue-800 rounded-full h-2">
+                    <div 
+                      className="bg-blue-500 h-2 rounded-full transition-all duration-300" 
+                      style={{ width: `${Math.max(5, (uploadProgress.currentPage / uploadProgress.totalPages) * 100)}%` }}
+                    ></div>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </Card>
       )}

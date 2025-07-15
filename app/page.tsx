@@ -731,7 +731,7 @@ export default function ChatApp() {
                 </span>
               )}
               <br />
-              🧠 Vector embeddings with text-embedding-nomic-embed-text-v2-moe for semantic search
+              Vector embeddings with text-embedding-nomic-embed-text-v2-moe for semantic search
             </p>
           </div>
         </div>

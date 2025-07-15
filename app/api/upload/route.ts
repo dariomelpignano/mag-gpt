@@ -100,11 +100,12 @@ async function convertPDFToImages(pdfPath: string, outputDir: string): Promise<s
 }
 
 // Funzione per estrarre testo da PDF scansionati usando OCR
-async function extractTextFromScannedPDF(buffer: Buffer): Promise<string> {
+async function extractTextFromScannedPDF(buffer: Buffer, progressCallback?: (progress: { currentPage: number, totalPages: number, status: string }) => void): Promise<string> {
   let tempDir: string | null = null
   
   try {
     console.log('[UPLOAD] Avvio OCR per PDF scansionato...')
+    progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Preparing PDF for OCR...' })
     
     // Crea una directory temporanea
     tempDir = await fs.mkdtemp(path.join(tmpdir(), 'pdf-ocr-'))
@@ -115,7 +116,11 @@ async function extractTextFromScannedPDF(buffer: Buffer): Promise<string> {
     
     // Converti PDF in immagini usando pdftoppm direttamente
     console.log('[UPLOAD] Conversione PDF in immagini...')
+    progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Converting PDF to images...' })
     const imagePaths = await convertPDFToImages(pdfPath, tempDir)
+    
+    const totalPages = imagePaths.length
+    progressCallback?.({ currentPage: 0, totalPages, status: `Starting OCR on ${totalPages} pages...` })
     
     // Configura Tesseract
     const tesseractConfig = {
@@ -130,24 +135,28 @@ async function extractTextFromScannedPDF(buffer: Buffer): Promise<string> {
     // Processa ogni immagine con OCR
     for (let i = 0; i < imagePaths.length; i++) {
       const imagePath = imagePaths[i]
-      console.log(`[UPLOAD] OCR pagina ${i + 1}/${imagePaths.length}...`)
+      const currentPage = i + 1
+      console.log(`[UPLOAD] OCR pagina ${currentPage}/${totalPages}...`)
+      progressCallback?.({ currentPage, totalPages, status: `Processing page ${currentPage} of ${totalPages}...` })
       
       try {
         const pageText = await tesseract.recognize(imagePath, tesseractConfig)
         fullText += pageText.trim() + '\n\n'
-        console.log(`[UPLOAD] Pagina ${i + 1}: estratti ${pageText.trim().length} caratteri`)
+        console.log(`[UPLOAD] Pagina ${currentPage}: estratti ${pageText.trim().length} caratteri`)
       } catch (pageError) {
-        console.warn(`[UPLOAD] Errore OCR pagina ${i + 1}:`, pageError)
-        fullText += `[Errore nell'elaborazione della pagina ${i + 1}]\n\n`
+        console.warn(`[UPLOAD] Errore OCR pagina ${currentPage}:`, pageError)
+        fullText += `[Errore nell'elaborazione della pagina ${currentPage}]\n\n`
       }
     }
     
     console.log(`[UPLOAD] OCR completato. Testo totale estratto: ${fullText.trim().length} caratteri`)
+    progressCallback?.({ currentPage: totalPages, totalPages, status: 'OCR completed successfully!' })
     
     return fullText.trim()
     
   } catch (error) {
     console.error('[UPLOAD] Errore OCR:', error)
+    progressCallback?.({ currentPage: 0, totalPages: 0, status: 'OCR failed' })
     throw new Error(`OCR fallito: ${error instanceof Error ? error.message : 'Errore sconosciuto'}`)
   } finally {
     // Pulizia file temporanei
@@ -163,22 +172,24 @@ async function extractTextFromScannedPDF(buffer: Buffer): Promise<string> {
 }
 
 // Funzione principale per estrarre testo da PDF con fallback OCR
-async function extractTextFromPDFWithOCR(buffer: Buffer): Promise<string> {
+async function extractTextFromPDFWithOCR(buffer: Buffer, progressCallback?: (progress: { currentPage: number, totalPages: number, status: string }) => void): Promise<string> {
   try {
     // Prima prova con pdf2json
     console.log('[UPLOAD] Tentativo estrazione testo con pdf2json...')
+    progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Trying text extraction...' })
     const text = await extractTextFromPDF(buffer)
     console.log(`[UPLOAD] Successo pdf2json: ${text.length} caratteri estratti`)
+    progressCallback?.({ currentPage: 1, totalPages: 1, status: 'Text extraction completed!' })
     return text
   } catch (error) {
     if (error instanceof Error && error.message === 'SCANNED_PDF') {
       console.log('[UPLOAD] Rilevato PDF scansionato, avvio OCR...')
       // Se è un PDF scansionato, usa OCR
-      return await extractTextFromScannedPDF(buffer)
+      return await extractTextFromScannedPDF(buffer, progressCallback)
     } else {
       console.log('[UPLOAD] pdf2json fallito, tentativo OCR come fallback...')
       // Se pdf2json fallisce per altri motivi, prova comunque OCR
-      return await extractTextFromScannedPDF(buffer)
+      return await extractTextFromScannedPDF(buffer, progressCallback)
     }
   }
 }
@@ -212,10 +223,10 @@ export async function POST(request: NextRequest) {
     if (!file) {
       return NextResponse.json({ error: 'Nessun file caricato' }, { status: 400 })
     }
-    // File size check (100MB limit)
-    const MAX_SIZE = 100 * 1024 * 1024
+    // File size check (200MB limit)
+    const MAX_SIZE = 200 * 1024 * 1024
     if (file.size > MAX_SIZE) {
-      return NextResponse.json({ error: 'Il file è troppo grande. Limite massimo: 100MB.' }, { status: 413 })
+      return NextResponse.json({ error: 'Il file è troppo grande. Limite massimo: 200MB.' }, { status: 413 })
     }
     // Get user from cookie if available
     let user = 'unknown'
