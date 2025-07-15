@@ -207,6 +207,10 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
                     handleUploadComplete(data.result, contextMode, index)
                     resolve()
                     return
+                  } else if (data.type === 'cancelled') {
+                    setUploadProgress(null)
+                    reject(new Error('Upload cancelled'))
+                    return
                   } else if (data.type === 'error') {
                     setUploadProgress(null)
                     reject(new Error(data.error))
@@ -407,7 +411,7 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
               variant="ghost"
               size="sm"
               onClick={cancelUpload}
-              className="h-6 w-6 p-0 text-red-500 hover:text-red-700 hover:bg-red-100 dark:hover:bg-red-900"
+              className="h-6 w-6 p-0 text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800"
               title="Cancel upload"
             >
               <X className="w-4 h-4" />
@@ -448,7 +452,7 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
               variant="outline"
               size="sm"
               onClick={cancelUpload}
-              className="text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950 border-red-300"
+              className="text-gray-600 hover:text-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800 border-gray-300"
             >
               <X className="w-4 h-4 mr-1" />
               Cancel

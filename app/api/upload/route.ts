@@ -101,12 +101,21 @@ async function convertPDFToImages(pdfPath: string, outputDir: string): Promise<s
 }
 
 // Funzione per estrarre testo da PDF scansionati usando OCR
-async function extractTextFromScannedPDF(buffer: Buffer, progressCallback?: (progress: { currentPage: number, totalPages: number, status: string }) => void): Promise<string> {
+async function extractTextFromScannedPDF(
+  buffer: Buffer, 
+  progressCallback?: (progress: { currentPage: number, totalPages: number, status: string }) => void,
+  request?: NextRequest
+): Promise<string> {
   let tempDir: string | null = null
   
   try {
     console.log('[UPLOAD] Avvio OCR per PDF scansionato...')
     progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Preparing PDF for OCR...' })
+    
+    // Check if request was cancelled
+    if (request?.signal?.aborted) {
+      throw new Error('Request cancelled')
+    }
     
     // Crea una directory temporanea
     tempDir = await fs.mkdtemp(path.join(tmpdir(), 'pdf-ocr-'))
@@ -118,6 +127,12 @@ async function extractTextFromScannedPDF(buffer: Buffer, progressCallback?: (pro
     // Converti PDF in immagini usando pdftoppm direttamente
     console.log('[UPLOAD] Conversione PDF in immagini...')
     progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Converting PDF to images...' })
+    
+    // Check cancellation again before expensive operation
+    if (request?.signal?.aborted) {
+      throw new Error('Request cancelled')
+    }
+    
     const imagePaths = await convertPDFToImages(pdfPath, tempDir)
     
     const totalPages = imagePaths.length
@@ -163,6 +178,12 @@ async function extractTextFromScannedPDF(buffer: Buffer, progressCallback?: (pro
     
     // Processa ogni immagine con OCR
     for (let i = 0; i < imagePaths.length; i++) {
+      // Check for cancellation before processing each page
+      if (request?.signal?.aborted) {
+        console.log(`[UPLOAD] Request cancelled, stopping OCR at page ${i + 1}/${totalPages}`)
+        throw new Error('Request cancelled')
+      }
+      
       const imagePath = imagePaths[i]
       const currentPage = i + 1
       console.log(`[UPLOAD] OCR pagina ${currentPage}/${totalPages}...`)
@@ -184,6 +205,11 @@ async function extractTextFromScannedPDF(buffer: Buffer, progressCallback?: (pro
     return fullText.trim()
     
   } catch (error) {
+    if (error instanceof Error && error.message === 'Request cancelled') {
+      console.log('[UPLOAD] OCR process cancelled by client')
+      progressCallback?.({ currentPage: 0, totalPages: 0, status: 'OCR cancelled' })
+      throw error
+    }
     console.error('[UPLOAD] Errore OCR:', error)
     progressCallback?.({ currentPage: 0, totalPages: 0, status: 'OCR failed' })
     throw new Error(`OCR fallito: ${error instanceof Error ? error.message : 'Errore sconosciuto'}`)
@@ -201,24 +227,39 @@ async function extractTextFromScannedPDF(buffer: Buffer, progressCallback?: (pro
 }
 
 // Funzione principale per estrarre testo da PDF con fallback OCR
-async function extractTextFromPDFWithOCR(buffer: Buffer, progressCallback?: (progress: { currentPage: number, totalPages: number, status: string }) => void): Promise<string> {
+async function extractTextFromPDFWithOCR(
+  buffer: Buffer, 
+  progressCallback?: (progress: { currentPage: number, totalPages: number, status: string }) => void,
+  request?: NextRequest
+): Promise<string> {
   try {
     // Prima prova con pdf2json
     console.log('[UPLOAD] Tentativo estrazione testo con pdf2json...')
     progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Trying text extraction...' })
+    
+    // Check cancellation before starting
+    if (request?.signal?.aborted) {
+      throw new Error('Request cancelled')
+    }
+    
     const text = await extractTextFromPDF(buffer)
     console.log(`[UPLOAD] Successo pdf2json: ${text.length} caratteri estratti`)
     progressCallback?.({ currentPage: 1, totalPages: 1, status: 'Text extraction completed!' })
     return text
   } catch (error) {
+    // Check cancellation before fallback
+    if (request?.signal?.aborted) {
+      throw new Error('Request cancelled')
+    }
+    
     if (error instanceof Error && error.message === 'SCANNED_PDF') {
       console.log('[UPLOAD] Rilevato PDF scansionato, avvio OCR...')
       // Se è un PDF scansionato, usa OCR
-      return await extractTextFromScannedPDF(buffer, progressCallback)
+      return await extractTextFromScannedPDF(buffer, progressCallback, request)
     } else {
       console.log('[UPLOAD] pdf2json fallito, tentativo OCR come fallback...')
       // Se pdf2json fallisce per altri motivi, prova comunque OCR
-      return await extractTextFromScannedPDF(buffer, progressCallback)
+      return await extractTextFromScannedPDF(buffer, progressCallback, request)
     }
   }
 }
@@ -292,7 +333,7 @@ export async function POST(request: NextRequest) {
           }
 
           // Process the PDF with progress updates
-          extractTextFromPDFWithOCR(buffer, progressCallback)
+          extractTextFromPDFWithOCR(buffer, progressCallback, request)
             .then(async (text) => {
               extractedText = text
               
@@ -340,11 +381,21 @@ export async function POST(request: NextRequest) {
             })
             .catch((error) => {
               console.error('[UPLOAD] Error during streaming processing:', error)
-              const errorData = `data: ${JSON.stringify({ 
-                type: 'error', 
-                error: `Errore nell'analisi del PDF: ${error instanceof Error ? error.message : 'Errore sconosciuto'}`
-              })}\n\n`
-              controller.enqueue(encoder.encode(errorData))
+              
+              // Check if it's a cancellation
+              if (error instanceof Error && error.message === 'Request cancelled') {
+                const cancelData = `data: ${JSON.stringify({ 
+                  type: 'cancelled', 
+                  message: 'Upload cancelled'
+                })}\n\n`
+                controller.enqueue(encoder.encode(cancelData))
+              } else {
+                const errorData = `data: ${JSON.stringify({ 
+                  type: 'error', 
+                  error: `Errore nell'analisi del PDF: ${error instanceof Error ? error.message : 'Errore sconosciuto'}`
+                })}\n\n`
+                controller.enqueue(encoder.encode(errorData))
+              }
               controller.close()
             })
         }
@@ -364,7 +415,7 @@ export async function POST(request: NextRequest) {
     switch (file.type) {
       case 'application/pdf':
         try {
-          extractedText = await extractTextFromPDFWithOCR(buffer)
+          extractedText = await extractTextFromPDFWithOCR(buffer, undefined, request)
           console.log(`[UPLOAD] Successo! Testo estratto: ${extractedText.length} caratteri`)
         } catch (error) {
           console.error('[UPLOAD] Errore estrazione PDF:', error)

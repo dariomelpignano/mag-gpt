@@ -483,7 +483,7 @@ export default function ChatApp() {
               variant="outline"
               size="sm"
               onClick={handleLogout}
-              className="flex items-center space-x-2 bg-transparent text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950"
+              className="flex items-center space-x-2 bg-transparent"
             >
               <LogOut className="w-4 h-4" />
               <span className="hidden sm:inline">Logout</span>
