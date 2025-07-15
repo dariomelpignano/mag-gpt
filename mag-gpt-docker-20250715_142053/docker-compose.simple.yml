@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  mag-gpt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mag-gpt-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - LM_STUDIO_BASE_URL=${LM_STUDIO_BASE_URL:-http://192.168.97.3:5002}
+      - LM_STUDIO_EMBEDDINGS_MODEL=${LM_STUDIO_EMBEDDINGS_MODEL:-text-embedding-nomic-embed-text-v2-moe}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-your-super-secret-key-change-this}
+      - NEXTAUTH_URL=${NEXTAUTH_URL:-http://localhost:3000}
+      # User authentication
+      - USER_admin_company_com=${USER_ADMIN_PASSWORD:-adminpassword}
+      - USER_colleague_company_com=${USER_COLLEAGUE_PASSWORD:-colleaguepassword}
+      - USER_demo_test_com=demopass123
+    volumes:
+      # Persist application data
+      - mag-gpt-data:/app/data
+      - mag-gpt-cache:/app/.next/cache
+    networks:
+      - mag-gpt-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  mag-gpt-network:
+    driver: bridge
+
+volumes:
+  mag-gpt-data:
+    driver: local
+  mag-gpt-cache:
+    driver: local 

@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { X, FileText, File, Image, FileCode, FileArchive, FileSpreadsheet, FileType } from "lucide-react"
+import { RadioGroup } from '@/components/ui/radio-group'
 
 export interface UploadedFile {
   id: string
@@ -11,12 +12,14 @@ export interface UploadedFile {
   type: string
   content: string
   uploadedAt: Date
+  persistent?: boolean // true if saved as context
 }
 
 interface FileUploadProps {
   files: UploadedFile[]
   onFilesChange: (files: UploadedFile[] | ((prev: UploadedFile[]) => UploadedFile[])) => void
   disabled?: boolean
+  removeFile?: (fileId: string) => void
 }
 
 const getFileIcon = (type: string, fileName: string) => {
@@ -38,15 +41,24 @@ const formatFileSize = (bytes: number) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
 }
 
-export function FileUpload({ files, onFilesChange, disabled = false }: FileUploadProps) {
+export function FileUpload({ files, onFilesChange, disabled = false, removeFile }: FileUploadProps) {
+  console.log('[FILE UPLOAD] Render', files)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [isUploading, setIsUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  const [contextMode, setContextMode] = useState<'session' | 'context'>('session')
 
   // Debug log for files prop
   useEffect(() => {
     console.log('[FILE-UPLOAD] Files prop updated:', files.length, files.map(f => f.name))
   }, [files])
+
+  useEffect(() => {
+    if (uploadError) {
+      const timer = setTimeout(() => setUploadError(null), 4000)
+      return () => clearTimeout(timer)
+    }
+  }, [uploadError])
 
   const acceptedFileTypes = [
     '.txt', '.md', '.json', '.js', '.ts', '.jsx', '.tsx', '.py', 
@@ -65,6 +77,7 @@ export function FileUpload({ files, onFilesChange, disabled = false }: FileUploa
         const file = selectedFiles[i]
         const formData = new FormData()
         formData.append('file', file)
+        formData.append('contextMode', contextMode)
 
         const response = await fetch('/api/upload', {
           method: 'POST',
@@ -86,24 +99,35 @@ export function FileUpload({ files, onFilesChange, disabled = false }: FileUploa
         const result = await response.json()
         
         if (result.success) {
-          const newFile: UploadedFile = {
-            id: `${Date.now()}-${Math.random()}-${i}`,
-            name: result.fileName,
-            size: result.fileSize,
-            type: result.fileType,
-            content: result.extractedText,
-            uploadedAt: new Date()
+          if (contextMode === 'context' && result.contextSaved) {
+            // For context files, trigger a page refresh to reload context files
+            // Don't add to session state as it will be loaded via context refresh
+            console.log(`[UPLOAD] Context file saved: ${result.fileName}`)
+            // Trigger a window event to notify the parent to refresh context
+            window.dispatchEvent(new CustomEvent('contextFileUploaded', { 
+              detail: { fileName: result.fileName } 
+            }))
+          } else {
+            // For session files, add directly to the file list
+            const newFile: UploadedFile = {
+              id: `${Date.now()}-${Math.random()}-${i}`,
+              name: result.fileName,
+              size: result.fileSize,
+              type: result.fileType,
+              content: result.extractedText || '',
+              uploadedAt: new Date(),
+              persistent: false
+            }
+            console.log(`[UPLOAD] Session file uploaded: ${newFile.name}, ID: ${newFile.id}`)
+            
+            // Use callback to add to existing files
+            onFilesChange((prevFiles: UploadedFile[]) => {
+              console.log(`[UPLOAD] Adding session file to ${prevFiles.length} existing files`)
+              const updatedFiles = [...prevFiles, newFile]
+              console.log(`[UPLOAD] Updated files count: ${updatedFiles.length}`)
+              return updatedFiles
+            })
           }
-          console.log(`[UPLOAD] File caricato: ${newFile.name}, ID: ${newFile.id}`)
-          console.log(`[UPLOAD] File esistenti: ${files.length}, Nuovi file: ${files.length + 1}`)
-          
-          // Usa una funzione di callback per assicurarsi che lo stato sia aggiornato
-          onFilesChange((prevFiles: UploadedFile[]) => {
-            console.log(`[UPLOAD] Callback - File precedenti: ${prevFiles.length}`)
-            const updatedFiles = [...prevFiles, newFile]
-            console.log(`[UPLOAD] Callback - File aggiornati: ${updatedFiles.length}`)
-            return updatedFiles
-          })
         }
       }
     } catch (error) {
@@ -119,8 +143,12 @@ export function FileUpload({ files, onFilesChange, disabled = false }: FileUploa
     }
   }
 
-  const removeFile = (fileId: string) => {
-    onFilesChange(files.filter(file => file.id !== fileId))
+  const handleRemove = (fileId: string) => {
+    if (typeof removeFile === 'function') {
+      removeFile(fileId)
+    } else {
+      onFilesChange(files.filter(file => file.id !== fileId))
+    }
   }
 
   const getFileContext = () => {
@@ -135,8 +163,22 @@ export function FileUpload({ files, onFilesChange, disabled = false }: FileUploa
 
   return (
     <div className="space-y-3">
+      {/* Context Mode Selector */}
+      <div className="flex items-center space-x-4 mb-2">
+        <label className="text-xs font-medium">Upload mode:</label>
+        <RadioGroup value={contextMode} onValueChange={(value) => setContextMode(value as 'session' | 'context')} className="flex flex-row space-x-2">
+          <label className="flex items-center space-x-1 text-xs">
+            <input type="radio" value="session" checked={contextMode === 'session'} onChange={() => setContextMode('session')} />
+            <span>Session only</span>
+          </label>
+          <label className="flex items-center space-x-1 text-xs">
+            <input type="radio" value="context" checked={contextMode === 'context'} onChange={() => setContextMode('context')} />
+            <span>Save as context</span>
+          </label>
+        </RadioGroup>
+      </div>
       {/* Error Display */}
-      {uploadError && (
+      {uploadError && uploadError.trim() && (
         <Card className="p-3 border-red-200 bg-red-50 dark:border-red-800 dark:bg-red-950">
           <div className="flex items-start space-x-2">
             <X className="w-4 h-4 text-red-500 mt-0.5 flex-shrink-0" />
@@ -193,6 +235,29 @@ export function FileUpload({ files, onFilesChange, disabled = false }: FileUploa
         <p>Supported formats: PDF, DOC/DOCX, XLS/XLSX, TXT, MD, JSON, JS, TS, HTML, CSS, XML, CSV, LOG</p>
         <p>Maximum file size: 50MB per file</p>
       </div>
+
+      {/* Uploaded Files List (add icon color logic) */}
+      {files.length > 0 && (
+        <div className="mt-2">
+          {files.map(file => (
+            <div key={file.id} className="flex items-center space-x-2 mb-1">
+              <span className={`inline-flex items-center justify-center w-5 h-5 rounded ${file.persistent ? 'bg-blue-500' : 'bg-gray-400'}`}>{getFileIcon(file.type, file.name)}</span>
+              <span className="truncate text-xs font-medium" title={file.name}>{file.name}</span>
+              <span className="text-xs text-gray-500">({formatFileSize(file.size)})</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => { console.log('[REMOVE FILE] Clicked', file); handleRemove(file.id); }}
+                className="h-5 w-5 p-0 text-gray-400 hover:text-red-500"
+                title="Remove file"
+              >
+                <X className="w-4 h-4" />
+              </Button>
+              {file.persistent && <span className="text-xs text-blue-600 ml-1">context</span>}
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Hidden context getter */}
       <div className="hidden">

@@ -6,6 +6,8 @@ import fs from 'fs/promises'
 import { tmpdir } from 'os'
 import { exec } from 'child_process'
 import { promisify } from 'util'
+import { logInteraction } from '@/lib/logger'
+import { existsSync, mkdirSync, writeFileSync } from 'fs'
 
 const execAsync = promisify(exec)
 
@@ -195,20 +197,47 @@ Per utilizzare documenti scansionati, puoi:
 Il sistema funziona meglio con PDF che contengono testo selezionabile (non scansionati).`
 }
 
+export const config = {
+  api: {
+    bodyParser: false, // Required for file uploads
+    // Note: Next.js does not support a direct size limit here for formData, so we check manually below
+  },
+}
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData()
     const file = formData.get('file') as File
-    
+    const contextMode = formData.get('contextMode') as string | null
     if (!file) {
       return NextResponse.json({ error: 'Nessun file caricato' }, { status: 400 })
     }
-    
-    console.log(`[UPLOAD] Processando file: ${file.name} (${file.type}, ${file.size} bytes)`)
-    
+    // File size check (100MB limit)
+    const MAX_SIZE = 100 * 1024 * 1024
+    if (file.size > MAX_SIZE) {
+      return NextResponse.json({ error: 'Il file è troppo grande. Limite massimo: 100MB.' }, { status: 413 })
+    }
+    // Get user from cookie if available
+    let user = 'unknown'
+    try {
+      const cookie = request.headers.get('cookie') || ''
+      const match = cookie.match(/mag-gpt-auth=([^;]+)/)
+      if (match) user = decodeURIComponent(match[1])
+    } catch {}
+    // Log the upload attempt
+    logInteraction({
+      user,
+      action: 'file_upload',
+      data: {
+        fileName: file.name,
+        fileType: file.type,
+        fileSize: file.size,
+        contextMode: contextMode || 'session'
+      }
+    })
+    console.log(`[UPLOAD] Processando file: ${file.name} (${file.type}, ${file.size} bytes) [mode: ${contextMode}]`)
     const buffer = Buffer.from(await file.arrayBuffer())
     let extractedText = ''
-
     // Estrai testo in base al tipo di file
     switch (file.type) {
       case 'application/pdf':
@@ -217,7 +246,6 @@ export async function POST(request: NextRequest) {
           console.log(`[UPLOAD] Successo! Testo estratto: ${extractedText.length} caratteri`)
         } catch (error) {
           console.error('[UPLOAD] Errore estrazione PDF:', error)
-          
           return NextResponse.json(
             { 
               error: `Errore nell'analisi del PDF: ${error instanceof Error ? error.message : 'Errore sconosciuto'}`,
@@ -227,12 +255,10 @@ export async function POST(request: NextRequest) {
           )
         }
         break
-        
       case 'text/plain':
         extractedText = buffer.toString('utf-8')
         console.log(`[UPLOAD] File di testo processato: ${extractedText.length} caratteri`)
         break
-        
       default:
         return NextResponse.json(
           { 
@@ -242,7 +268,6 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         )
     }
-
     if (!extractedText.trim()) {
       return NextResponse.json(
         { 
@@ -252,21 +277,56 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       )
     }
-
-    return NextResponse.json({ 
+    // Chunking and vectorization placeholder (replace with your actual logic)
+    const chunked = [extractedText] // TODO: replace with real chunking
+    const vectors: any[] = [] // TODO: replace with real vectorization
+    // If contextMode is 'context', save to disk
+    if (contextMode === 'context' && user !== 'unknown') {
+      const username = user.split('@')[0]
+      const contextDir = path.join(process.cwd(), 'context', username)
+      if (!existsSync(contextDir)) {
+        mkdirSync(contextDir, { recursive: true })
+      }
+      const timestamp = Date.now()
+      const baseName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_')
+      const outPath = path.join(contextDir, `${timestamp}_${baseName}.json`)
+      writeFileSync(outPath, JSON.stringify({
+        fileName: file.name,
+        fileType: file.type,
+        fileSize: file.size,
+        chunked,
+        vectors,
+        uploadedAt: new Date().toISOString()
+      }, null, 2), 'utf-8')
+      return NextResponse.json({
+        success: true,
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type,
+        characterCount: extractedText.length,
+        contextSaved: true,
+        contextPath: outPath,
+        extractedText: extractedText // Return full text for context files too
+      })
+    }
+    // For session, return full text (not just preview)
+    return NextResponse.json({
       success: true,
-      extractedText: extractedText,
       fileName: file.name,
       fileSize: file.size,
       fileType: file.type,
-      characterCount: extractedText.length
+      characterCount: extractedText.length,
+      contextSaved: false,
+      extractedText: extractedText // Return full text for session files
     })
   } catch (error) {
+    // Improved error handling: always return JSON
     console.error('[UPLOAD] Errore generale:', error)
     return NextResponse.json(
       { 
         error: 'Errore durante il caricamento del file',
-        errorType: 'GENERAL_ERROR'
+        errorType: 'GENERAL_ERROR',
+        details: error instanceof Error ? error.message : String(error)
       },
       { status: 500 }
     )

@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { ChatOpenAI } from '@langchain/openai'
 import { PromptTemplate } from '@langchain/core/prompts'
 import { generateChunkEmbeddings, findRelevantChunks } from '@/lib/embeddings'
+import { logInteraction } from '@/lib/logger'
 
 // Funzione per dividere il testo in chunk
 function chunkText(text: string, chunkSize: number = 1000, overlap: number = 200): string[] {
@@ -121,6 +122,24 @@ export async function POST(request: NextRequest) {
     const lastMessage = messages[messages.length - 1]
     const userQuery = lastMessage.content
 
+    // Get user from cookie if available
+    let user = 'unknown'
+    try {
+      const cookie = request.headers.get('cookie') || ''
+      const match = cookie.match(/mag-gpt-auth=([^;]+)/)
+      if (match) user = decodeURIComponent(match[1])
+    } catch {}
+    // Log the interaction
+    logInteraction({
+      user,
+      action: 'chat_prompt',
+      data: {
+        prompt: userQuery,
+        model: selectedModel,
+        uploadedFiles: uploadedFiles ? uploadedFiles.map((f: any) => f.name) : []
+      }
+    })
+
     // Sistema RAG: chunking e retrieval con embeddings
     let context = ''
     if (uploadedFiles && uploadedFiles.length > 0) {
@@ -205,10 +224,11 @@ Please provide a clear, accurate, and helpful response. If the context doesn't c
 `)
 
     // LM Studio configuration
+    const baseUrl = process.env.LM_STUDIO_BASE_URL || 'http://192.168.97.3:5002'
     const llmModel = new ChatOpenAI({
       openAIApiKey: 'not-needed', // LM Studio doesn't require a real API key
       configuration: {
-        baseURL: 'http://192.168.97.3:5002/v1',
+        baseURL: `${baseUrl}/v1`,
       },
       modelName: selectedModel,
       temperature: 0.1, // Più deterministico per risposte precise

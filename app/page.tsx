@@ -14,6 +14,26 @@ import { FileUpload, UploadedFile } from "@/components/file-upload"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 
+// Extend UploadedFile type to allow 'persistent' property
+interface UploadedFileWithPersistent extends UploadedFile {
+  persistent?: boolean
+}
+
+// Utility to merge files by name, type, and content (avoiding duplicates)
+function mergeFiles(contextFiles: UploadedFileWithPersistent[], sessionFiles: UploadedFileWithPersistent[]): UploadedFileWithPersistent[] {
+  const seen = new Set<string>()
+  const merged: UploadedFileWithPersistent[] = []
+  for (const file of [...contextFiles, ...sessionFiles]) {
+    // Use a composite key to avoid duplicates
+    const key = `${file.name}|${file.type}|${file.content.length}`
+    if (!seen.has(key)) {
+      seen.add(key)
+      merged.push(file)
+    }
+  }
+  return merged
+}
+
 export default function ChatApp() {
   const { messages, input, handleInputChange, setMessages } = useChat()
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
@@ -23,6 +43,7 @@ export default function ChatApp() {
   const [selectedModel, setSelectedModel] = useState<string>("")
   const [modelsLoading, setModelsLoading] = useState(true)
   const [lastModelsRefresh, setLastModelsRefresh] = useState<Date | null>(null)
+  const [contextFiles, setContextFiles] = useState<any[]>([])
 
   // Debug log for uploaded files
   useEffect(() => {
@@ -71,6 +92,7 @@ export default function ChatApp() {
         if (response.ok) {
           const data = await response.json()
           setUserEmail(data.user?.email || "")
+          setContextFiles(data.contextFiles || [])
           // Refresh models when user is authenticated
           await fetchModels()
         }
@@ -82,6 +104,68 @@ export default function ChatApp() {
     }
     fetchUserInfo()
   }, [])
+
+  // Listen for context file uploads and refresh context files
+  useEffect(() => {
+    const handleContextFileUploaded = async () => {
+      console.log('[PAGE] Context file uploaded, refreshing context files...')
+      try {
+        const response = await fetch('/api/auth/me')
+        if (response.ok) {
+          const data = await response.json()
+          setContextFiles(data.contextFiles || [])
+        }
+      } catch (error) {
+        console.error('Failed to refresh context files:', error)
+      }
+    }
+
+    window.addEventListener('contextFileUploaded', handleContextFileUploaded)
+    return () => window.removeEventListener('contextFileUploaded', handleContextFileUploaded)
+  }, [])
+
+  // Load persistent context files into uploadedFiles on login or contextFiles change
+  useEffect(() => {
+    console.log('[PAGE] Context files changed:', contextFiles.length, contextFiles.map(c => c.fileName))
+    if (contextFiles.length > 0) {
+      Promise.all(contextFiles.map(async (ctx) => {
+        try {
+          const res = await fetch(`/api/context-file?path=${encodeURIComponent(ctx.contextPath)}`)
+          if (res.ok) {
+            const data = await res.json()
+            return {
+              id: `context-${ctx.fileName}`,
+              name: ctx.fileName,
+              size: ctx.fileSize,
+              type: ctx.fileType,
+              content: data.content,
+              uploadedAt: ctx.uploadedAt,
+              persistent: true
+            } as UploadedFileWithPersistent
+          }
+        } catch {}
+        return null
+      })).then((files) => {
+        const validContextFiles = files.filter((f): f is UploadedFileWithPersistent => !!f)
+        console.log('[PAGE] Loaded context files:', validContextFiles.length, validContextFiles.map(f => f.name))
+        setUploadedFiles((prev) => {
+          const sessionFiles = prev.filter(f => !f.persistent)
+          console.log('[PAGE] Current session files:', sessionFiles.length, sessionFiles.map(f => f.name))
+          const merged = mergeFiles(validContextFiles, sessionFiles)
+          console.log('[PAGE] Merged files:', merged.length, merged.map(f => `${f.name}(${f.persistent ? 'context' : 'session'})`))
+          return merged
+        })
+      })
+    } else {
+      // If no context files, preserve session files
+      console.log('[PAGE] No context files, filtering out persistent files')
+      setUploadedFiles((prev) => {
+        const sessionOnly = prev.filter(f => !f.persistent)
+        console.log('[PAGE] Session-only files:', sessionOnly.length, sessionOnly.map(f => f.name))
+        return sessionOnly
+      })
+    }
+  }, [contextFiles])
 
   // Refresh models when the window gains focus (user switches back to the app)
   useEffect(() => {
@@ -294,6 +378,35 @@ export default function ChatApp() {
     }
   }
 
+  // Unified removeFile logic for both session and context files
+  const removeFile = async (fileId: string) => {
+    const file = uploadedFiles.find(f => f.id === fileId)
+    console.log('[REMOVE FILE] Called for', fileId, file)
+    if (file?.persistent) {
+      // Call API to delete context file
+      try {
+        console.log('[REMOVE FILE] Sending DELETE for', { name: file.name, uploadedAt: file.uploadedAt })
+        await fetch('/api/context-file', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: file.name, uploadedAt: typeof file.uploadedAt === 'string' ? file.uploadedAt : file.uploadedAt.toISOString() })
+        })
+        // Refresh context files after deletion
+        const response = await fetch('/api/auth/me')
+        if (response.ok) {
+          const data = await response.json()
+          // Remove the deleted file from UI state
+          setUploadedFiles((prev) => prev.filter(f => f.id !== fileId))
+        }
+      } catch (err) {
+        alert('Failed to delete context file on server.')
+        return
+      }
+    } else {
+      setUploadedFiles(uploadedFiles.filter(file => file.id !== fileId))
+    }
+  }
+
   return (
     <div className="flex flex-col h-screen bg-gray-50 dark:bg-gray-900">
       {/* Header */}
@@ -350,7 +463,7 @@ export default function ChatApp() {
             {/* User Info */}
             <div className="hidden sm:flex items-center space-x-2 text-sm text-gray-600 dark:text-gray-300">
               <User className="w-4 h-4" />
-              <span>{userEmail}</span>
+              <span>{userEmail ? userEmail.split('@')[0] : 'User'}</span>
             </div>
             
             <ThemeToggle />
@@ -410,7 +523,7 @@ export default function ChatApp() {
                       className="flex items-center justify-between p-2 bg-white dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600"
                     >
                       <div className="flex items-center space-x-2 min-w-0 flex-1">
-                        <FileText className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                        <span className={`inline-flex items-center justify-center w-5 h-5 rounded ${file.persistent ? 'bg-blue-500' : 'bg-gray-400'}`}>{/* icon */}<FileText className="w-4 h-4 text-white flex-shrink-0" /></span>
                         <div className="min-w-0 flex-1">
                           <p className="text-xs font-medium text-gray-900 dark:text-gray-100 truncate">
                             {file.name}
@@ -421,15 +534,13 @@ export default function ChatApp() {
                         </div>
                       </div>
                       <button
-                        onClick={() => {
-                          const newFiles = uploadedFiles.filter(f => f.id !== file.id)
-                          setUploadedFiles(newFiles)
-                        }}
+                        onClick={() => removeFile(file.id)}
                         className="ml-2 p-1 text-gray-400 hover:text-red-500 transition-colors flex-shrink-0"
                         disabled={isStreaming}
                       >
                         <Trash2 className="w-3 h-3" />
                       </button>
+                      {file.persistent && <span className="text-xs text-blue-600 ml-1">context</span>}
                     </div>
                   ))}
                 </div>
@@ -552,7 +663,17 @@ export default function ChatApp() {
                 </div>
                 <FileUpload 
                   files={uploadedFiles} 
-                  onFilesChange={updateUploadedFiles} 
+                  onFilesChange={(updater) => {
+                    // Only handle session files here, context files are handled via context refresh
+                    setUploadedFiles((prev) => {
+                      if (typeof updater === 'function') {
+                        return updater(prev)
+                      } else {
+                        return updater
+                      }
+                    })
+                  }}
+                  removeFile={removeFile}
                   disabled={isStreaming}
                 />
               </>

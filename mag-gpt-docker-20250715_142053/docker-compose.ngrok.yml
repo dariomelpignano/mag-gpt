@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  mag-gpt:
+    environment:
+      - NODE_ENV=development
+      - NEXTAUTH_URL=${NGROK_URL:-http://localhost:3000}
+      - LM_STUDIO_BASE_URL=${LM_STUDIO_BASE_URL:-http://192.168.97.3:5002}
+      - LM_STUDIO_EMBEDDINGS_MODEL=${LM_STUDIO_EMBEDDINGS_MODEL:-text-embedding-nomic-embed-text-v2-moe}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-dev-secret-change-in-production}
+      # User authentication
+      - USER_demo_ngrok_dev=password123
+      - USER_test_user_com=testpass456
+    ports:
+      - "3000:3000"
+    volumes:
+      # Development: mount source code for hot reload
+      - ../app:/app/app:ro
+      - ../components:/app/components:ro
+      - ../lib:/app/lib:ro
+      - ../hooks:/app/hooks:ro
+      - ../types:/app/types:ro
+      - ../public:/app/public:ro
+      # Data persistence for development
+      - ngrok-data:/app/data
+    networks:
+      - mag-gpt-network
+
+  # ngrok service to expose the app
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: mag-gpt-ngrok
+    restart: unless-stopped
+    command:
+      - "start"
+      - "--all"
+      - "--config"
+      - "/etc/ngrok.yml"
+    volumes:
+      - ./ngrok.yml:/etc/ngrok.yml:ro
+    ports:
+      - "4040:4040"  # ngrok web interface
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    depends_on:
+      - mag-gpt
+    networks:
+      - mag-gpt-network
+
+  # Optional: Remove nginx for development
+  nginx:
+    profiles:
+      - production
+
+volumes:
+  ngrok-data:
+    driver: local
+
+networks:
+  mag-gpt-network:
+    driver: bridge 
