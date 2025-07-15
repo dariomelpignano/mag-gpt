@@ -73,8 +73,9 @@ async function extractTextFromPDF(buffer: Buffer): Promise<string> {
 // Funzione per convertire PDF in immagini usando pdftoppm direttamente
 async function convertPDFToImages(pdfPath: string, outputDir: string): Promise<string[]> {
   try {
-    // Usa pdftoppm dal sistema (installato con Homebrew)
-    const command = `pdftoppm -jpeg -r 200 "${pdfPath}" "${path.join(outputDir, 'page')}"`
+    // Usa pdftoppm con parametri ottimizzati per OCR LSTM
+    // 300 DPI è ottimale per Tesseract LSTM (migliore di 200 per testi piccoli)
+    const command = `pdftoppm -jpeg -r 300 -jpegopt quality=95 "${pdfPath}" "${path.join(outputDir, 'page')}"`
     console.log(`[UPLOAD] Eseguendo comando: ${command}`)
     
     const { stdout, stderr } = await execAsync(command)
@@ -90,7 +91,7 @@ async function convertPDFToImages(pdfPath: string, outputDir: string): Promise<s
       .sort()
       .map(file => path.join(outputDir, file))
     
-    console.log(`[UPLOAD] Generati ${imageFiles.length} file immagine`)
+    console.log(`[UPLOAD] Generati ${imageFiles.length} file immagine a 300 DPI`)
     return imageFiles
     
   } catch (error) {
@@ -122,12 +123,40 @@ async function extractTextFromScannedPDF(buffer: Buffer, progressCallback?: (pro
     const totalPages = imagePaths.length
     progressCallback?.({ currentPage: 0, totalPages, status: `Starting OCR on ${totalPages} pages...` })
     
-    // Configura Tesseract
+    // Configura Tesseract con ottimizzazioni per LSTM
+    // Tesseract 5.x con LSTM offre il miglior equilibrio tra accuratezza, velocità e elaborazione locale
+    // Ottimizzazioni implementate:
+    // - OEM 1: Solo LSTM (neural network), nessun engine legacy
+    // - PSM 6: Blocco uniforme di testo (ottimale per documenti)
+    // - 300 DPI: Risoluzione ottimale per LSTM (migliore di 200 per testi piccoli)
+    // - Multi-lingua: IT+EN+FR+DE+ES per documenti europei
+    // - Dictionary correction: Correzioni intelligenti post-OCR
     const tesseractConfig = {
-      lang: 'ita+eng', // Italiano e inglese
-      oem: 1, // LSTM OCR Engine Mode
-      psm: 3, // Automatic page segmentation
-      tessedit_char_whitelist: undefined // Nessuna limitazione di caratteri
+      // Ottimizzazione linguaggi: priorità italiana/inglese + supporto europeo
+      lang: 'ita+eng+fra+deu+spa', // Italian, English, French, German, Spanish
+      oem: 1, // LSTM OCR Engine Mode (Tesseract 5.x) - Best for accuracy
+      psm: 6, // Uniform block of text (better for documents than psm 3)
+      
+      // LSTM-specific optimizations
+      tessedit_char_whitelist: undefined, // No restrictions for LSTM
+      tessedit_pageseg_mode: 6, // Explicit PSM setting
+      
+      // Performance optimizations
+      tessedit_ocr_engine_mode: 1, // Force LSTM only
+      preserve_interword_spaces: 1, // Better spacing
+      
+      // Quality improvements
+      tessedit_create_hocr: 0, // Disable HOCR for speed
+      tessedit_create_tsv: 0,  // Disable TSV for speed
+      textord_really_old_xheight: 1, // Better line detection
+      
+      // Language model confidence (optimized for LSTM)
+      language_model_penalty_non_freq_dict_word: 0.1,
+      language_model_penalty_non_dict_word: 0.15,
+      
+      // LSTM neural network confidence
+      classify_bln_numeric_mode: 0, // Let LSTM handle numbers
+      tessedit_enable_dict_correction: 1, // Dictionary correction
     }
     
     let fullText = ''
