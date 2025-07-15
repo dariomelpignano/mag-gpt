@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { X, FileText, File, Image, FileCode, FileArchive, FileSpreadsheet, FileType } from "lucide-react"
+import { X, FileText, File, Image, FileCode, FileArchive, FileSpreadsheet, FileType, Paperclip } from "lucide-react"
 import { RadioGroup } from '@/components/ui/radio-group'
 
 export interface UploadedFile {
@@ -53,6 +53,7 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
     totalPages: number
     status: string
   } | null>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   // Debug log for files prop
   useEffect(() => {
@@ -65,6 +66,22 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
       return () => clearTimeout(timer)
     }
   }, [uploadError])
+
+  const cancelUpload = () => {
+    console.log('[UPLOAD] Cancelling upload...')
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+    }
+    setIsUploading(false)
+    setUploadProgress(null)
+    setUploadError('Upload cancelled by user')
+    
+    // Reset input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+  }
 
   const acceptedFileTypes = [
     '.txt', '.md', '.json', '.js', '.ts', '.jsx', '.tsx', '.py', 
@@ -79,8 +96,17 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
     setUploadError(null) // Clear previous errors
     setUploadProgress(null) // Clear previous progress
 
+    // Create abort controller for this upload session
+    abortControllerRef.current = new AbortController()
+
     try {
       for (let i = 0; i < selectedFiles.length; i++) {
+        // Check if upload was cancelled
+        if (abortControllerRef.current?.signal.aborted) {
+          console.log('[UPLOAD] Upload cancelled, stopping file processing')
+          break
+        }
+
         const file = selectedFiles[i]
         
         // Check if this is a large PDF that should use streaming
@@ -95,12 +121,18 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
         }
       }
     } catch (error) {
-      console.error('Error uploading files:', error)
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
-      setUploadError(errorMessage)
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.log('[UPLOAD] Upload aborted by user')
+        setUploadError('Upload cancelled')
+      } else {
+        console.error('Error uploading files:', error)
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+        setUploadError(errorMessage)
+      }
       setUploadProgress(null) // Clear progress on error
     } finally {
       setIsUploading(false)
+      abortControllerRef.current = null
       // Reset input
       if (fileInputRef.current) {
         fileInputRef.current.value = ''
@@ -125,6 +157,7 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
       fetch('/api/upload', {
         method: 'POST',
         body: formData,
+        signal: abortControllerRef.current?.signal // Add abort signal
       })
       .then(response => {
         if (!response.ok) {
@@ -140,6 +173,14 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
 
         const readStream = () => {
           reader.read().then(({ done, value }) => {
+            // Check if upload was cancelled
+            if (abortControllerRef.current?.signal.aborted) {
+              reader.cancel()
+              setUploadProgress(null)
+              reject(new Error('Upload cancelled'))
+              return
+            }
+
             if (done) {
               setUploadProgress(null)
               resolve()
@@ -197,8 +238,13 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
       response = await fetch('/api/upload', {
         method: 'POST',
         body: formData,
+        signal: abortControllerRef.current?.signal // Add abort signal
       })
     } catch (fetchError) {
+      // Check if it's an abort error
+      if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+        throw fetchError // Re-throw abort errors
+      }
       console.error('Network error during upload:', fetchError)
       throw new Error(`Network error: ${fetchError instanceof Error ? fetchError.message : 'Connection failed'}`)
     }
@@ -357,23 +403,58 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
                 </div>
               )}
             </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={cancelUpload}
+              className="h-6 w-6 p-0 text-red-500 hover:text-red-700 hover:bg-red-100 dark:hover:bg-red-900"
+              title="Cancel upload"
+            >
+              <X className="w-4 h-4" />
+            </Button>
           </div>
         </Card>
       )}
 
       {/* File Upload Button */}
       <div className="flex items-center space-x-2">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={disabled || isUploading}
-          className="flex items-center space-x-2"
-        >
-          <FileText className="w-4 h-4" />
-          <span>{isUploading ? 'Uploading...' : 'Upload Files'}</span>
-        </Button>
+        {!isUploading ? (
+          <>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={disabled}
+              className="flex items-center space-x-2"
+            >
+              <Paperclip className="w-4 h-4" />
+              <span>Carica file</span>
+            </Button>
+            <span className="text-xs text-gray-500 dark:text-gray-400">
+              Max {acceptedFileTypes.length} tipi di file supportati (200MB max)
+            </span>
+          </>
+        ) : (
+          <div className="flex items-center space-x-3">
+            <div className="flex items-center space-x-2">
+              <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+              <span className="text-sm text-blue-600 dark:text-blue-400">
+                {uploadProgress ? 'Processing...' : 'Uploading...'}
+              </span>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={cancelUpload}
+              className="text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950 border-red-300"
+            >
+              <X className="w-4 h-4 mr-1" />
+              Cancel
+            </Button>
+          </div>
+        )}
         <input
           ref={fileInputRef}
           type="file"
@@ -392,7 +473,7 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
       {/* Supported File Types Info */}
       <div className="text-xs text-gray-500 dark:text-gray-400">
         <p>Supported formats: PDF, DOC/DOCX, XLS/XLSX, TXT, MD, JSON, JS, TS, HTML, CSS, XML, CSV, LOG</p>
-        <p>Maximum file size: 50MB per file</p>
+        <p>Maximum file size: 200MB per file</p>
       </div>
 
       {/* Uploaded Files List (add icon color logic) */}
