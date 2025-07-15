@@ -321,10 +321,19 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
     if (contextMode === 'context' && result.contextSaved) {
       // For context files, trigger a page refresh to reload context files
       console.log(`[UPLOAD] Context file saved: ${result.fileName}`)
-      // Trigger a window event to notify the parent to refresh context
+      
+      // Trigger event immediately
       window.dispatchEvent(new CustomEvent('contextFileUploaded', { 
         detail: { fileName: result.fileName } 
       }))
+      
+      // Also trigger with a small delay to ensure backend has finished saving
+      setTimeout(() => {
+        console.log(`[UPLOAD] Triggering delayed context refresh for: ${result.fileName}`)
+        window.dispatchEvent(new CustomEvent('contextFileUploaded', { 
+          detail: { fileName: result.fileName, delayed: true } 
+        }))
+      }, 500)
     } else {
       // For session files, add directly to the file list
       const newFile: UploadedFile = {

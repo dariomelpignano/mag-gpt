@@ -107,16 +107,22 @@ export default function ChatApp() {
 
   // Listen for context file uploads and refresh context files
   useEffect(() => {
-    const handleContextFileUploaded = async () => {
-      console.log('[PAGE] Context file uploaded, refreshing context files...')
+    const handleContextFileUploaded = async (event: any) => {
+      const fileName = event.detail?.fileName || 'unknown'
+      const isDelayed = event.detail?.delayed || false
+      console.log(`[PAGE] Context file uploaded event received: ${fileName} (delayed: ${isDelayed})`)
+      
       try {
         const response = await fetch('/api/auth/me')
         if (response.ok) {
           const data = await response.json()
+          console.log(`[PAGE] Fetched ${data.contextFiles?.length || 0} context files from backend`)
           setContextFiles(data.contextFiles || [])
+        } else {
+          console.error('[PAGE] Failed to fetch context files:', response.status)
         }
       } catch (error) {
-        console.error('Failed to refresh context files:', error)
+        console.error('[PAGE] Failed to refresh context files:', error)
       }
     }
 
