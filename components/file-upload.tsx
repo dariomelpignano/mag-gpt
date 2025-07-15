@@ -82,94 +82,16 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
     try {
       for (let i = 0; i < selectedFiles.length; i++) {
         const file = selectedFiles[i]
-        const formData = new FormData()
-        formData.append('file', file)
-        formData.append('contextMode', contextMode)
-
-        // Set initial progress for large PDFs
-        if (file.type === 'application/pdf' && file.size > 10 * 1024 * 1024) { // 10MB+
-          setUploadProgress({
-            fileName: file.name,
-            currentPage: 0,
-            totalPages: 0,
-            status: 'Uploading large PDF...'
-          })
-        }
-
-        let response: Response
-        try {
-          response = await fetch('/api/upload', {
-            method: 'POST',
-            body: formData,
-          })
-        } catch (fetchError) {
-          console.error('Network error during upload:', fetchError)
-          throw new Error(`Network error: ${fetchError instanceof Error ? fetchError.message : 'Connection failed'}`)
-        }
-
-        let result: any
-        try {
-          // Check if response is JSON
-          const contentType = response.headers.get('content-type')
-          if (!contentType || !contentType.includes('application/json')) {
-            // Response is not JSON, likely an HTML error page
-            const textResponse = await response.text()
-            console.error('Non-JSON response received:', textResponse.substring(0, 500))
-            throw new Error('Server returned an HTML error page instead of JSON. This usually indicates a timeout or server error during processing.')
-          }
-          
-          result = await response.json()
-        } catch (parseError) {
-          console.error('Error parsing JSON response:', parseError)
-          if (parseError instanceof Error && parseError.message.includes('Unexpected token')) {
-            throw new Error('Server response was not valid JSON. The file processing may have timed out. Try uploading a smaller file or contact support.')
-          }
-          throw new Error(`Failed to parse server response: ${parseError instanceof Error ? parseError.message : 'Unknown parsing error'}`)
-        }
-
-        if (!response.ok) {
-          // Server returned an error
-          let errorMessage = result.error || 'Upload failed'
-          if (result.suggestions && Array.isArray(result.suggestions)) {
-            errorMessage += '\n\nSuggerimenti:\n' + result.suggestions.map((s: string) => `• ${s}`).join('\n')
-          }
-          
-          throw new Error(errorMessage)
-        }
         
-        if (result.success) {
-          // Clear progress when done
-          setUploadProgress(null)
-          
-          if (contextMode === 'context' && result.contextSaved) {
-            // For context files, trigger a page refresh to reload context files
-            // Don't add to session state as it will be loaded via context refresh
-            console.log(`[UPLOAD] Context file saved: ${result.fileName}`)
-            // Trigger a window event to notify the parent to refresh context
-            window.dispatchEvent(new CustomEvent('contextFileUploaded', { 
-              detail: { fileName: result.fileName } 
-            }))
-          } else {
-            // For session files, add directly to the file list
-            const newFile: UploadedFile = {
-              id: `${Date.now()}-${Math.random()}-${i}`,
-              name: result.fileName,
-              size: result.fileSize,
-              type: result.fileType,
-              content: result.extractedText || '',
-              uploadedAt: new Date(),
-              persistent: false
-            }
-            console.log(`[UPLOAD] Session file uploaded: ${newFile.name}, ID: ${newFile.id}`)
-            
-            // Use callback to add to existing files
-            onFilesChange((prevFiles: UploadedFile[]) => {
-              console.log(`[UPLOAD] Adding session file to ${prevFiles.length} existing files`)
-              const updatedFiles = [...prevFiles, newFile]
-              console.log(`[UPLOAD] Updated files count: ${updatedFiles.length}`)
-              return updatedFiles
-            })
-          }
+        // Check if this is a large PDF that should use streaming
+        const isLargePDF = file.type === 'application/pdf' && file.size > 10 * 1024 * 1024 // 10MB+
+        
+        if (isLargePDF) {
+          // Use Server-Sent Events for large PDFs
+          await handleStreamingUpload(file, contextMode, i)
+        } else {
+          // Use regular upload for smaller files
+          await handleRegularUpload(file, contextMode, i)
         }
       }
     } catch (error) {
@@ -183,6 +105,167 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
       if (fileInputRef.current) {
         fileInputRef.current.value = ''
       }
+    }
+  }
+
+  const handleStreamingUpload = async (file: File, contextMode: string, index: number): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('contextMode', contextMode)
+      formData.append('streamProgress', 'true')
+
+      setUploadProgress({
+        fileName: file.name,
+        currentPage: 0,
+        totalPages: 0,
+        status: 'Uploading large PDF...'
+      })
+
+      fetch('/api/upload', {
+        method: 'POST',
+        body: formData,
+      })
+      .then(response => {
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`)
+        }
+        
+        if (!response.body) {
+          throw new Error('No response body for streaming')
+        }
+
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+
+        const readStream = () => {
+          reader.read().then(({ done, value }) => {
+            if (done) {
+              setUploadProgress(null)
+              resolve()
+              return
+            }
+
+            const chunk = decoder.decode(value, { stream: true })
+            const lines = chunk.split('\n')
+
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                try {
+                  const data = JSON.parse(line.slice(6))
+                  
+                  if (data.type === 'progress') {
+                    setUploadProgress({
+                      fileName: file.name,
+                      currentPage: data.currentPage,
+                      totalPages: data.totalPages,
+                      status: data.status
+                    })
+                  } else if (data.type === 'complete') {
+                    setUploadProgress(null)
+                    handleUploadComplete(data.result, contextMode, index)
+                    resolve()
+                    return
+                  } else if (data.type === 'error') {
+                    setUploadProgress(null)
+                    reject(new Error(data.error))
+                    return
+                  }
+                } catch (parseError) {
+                  console.warn('Failed to parse SSE data:', line)
+                }
+              }
+            }
+
+            readStream() // Continue reading
+          }).catch(reject)
+        }
+
+        readStream()
+      })
+      .catch(reject)
+    })
+  }
+
+  const handleRegularUpload = async (file: File, contextMode: string, index: number): Promise<void> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('contextMode', contextMode)
+
+    let response: Response
+    try {
+      response = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData,
+      })
+    } catch (fetchError) {
+      console.error('Network error during upload:', fetchError)
+      throw new Error(`Network error: ${fetchError instanceof Error ? fetchError.message : 'Connection failed'}`)
+    }
+
+    let result: any
+    try {
+      // Check if response is JSON
+      const contentType = response.headers.get('content-type')
+      if (!contentType || !contentType.includes('application/json')) {
+        // Response is not JSON, likely an HTML error page
+        const textResponse = await response.text()
+        console.error('Non-JSON response received:', textResponse.substring(0, 500))
+        throw new Error('Server returned an HTML error page instead of JSON. This usually indicates a timeout or server error during processing.')
+      }
+      
+      result = await response.json()
+    } catch (parseError) {
+      console.error('Error parsing JSON response:', parseError)
+      if (parseError instanceof Error && parseError.message.includes('Unexpected token')) {
+        throw new Error('Server response was not valid JSON. The file processing may have timed out. Try uploading a smaller file or contact support.')
+      }
+      throw new Error(`Failed to parse server response: ${parseError instanceof Error ? parseError.message : 'Unknown parsing error'}`)
+    }
+
+    if (!response.ok) {
+      // Server returned an error
+      let errorMessage = result.error || 'Upload failed'
+      if (result.suggestions && Array.isArray(result.suggestions)) {
+        errorMessage += '\n\nSuggerimenti:\n' + result.suggestions.map((s: string) => `• ${s}`).join('\n')
+      }
+      
+      throw new Error(errorMessage)
+    }
+    
+    if (result.success) {
+      handleUploadComplete(result, contextMode, index)
+    }
+  }
+
+  const handleUploadComplete = (result: any, contextMode: string, index: number) => {
+    if (contextMode === 'context' && result.contextSaved) {
+      // For context files, trigger a page refresh to reload context files
+      console.log(`[UPLOAD] Context file saved: ${result.fileName}`)
+      // Trigger a window event to notify the parent to refresh context
+      window.dispatchEvent(new CustomEvent('contextFileUploaded', { 
+        detail: { fileName: result.fileName } 
+      }))
+    } else {
+      // For session files, add directly to the file list
+      const newFile: UploadedFile = {
+        id: `${Date.now()}-${Math.random()}-${index}`,
+        name: result.fileName,
+        size: result.fileSize,
+        type: result.fileType,
+        content: result.extractedText || '',
+        uploadedAt: new Date(),
+        persistent: false
+      }
+      console.log(`[UPLOAD] Session file uploaded: ${newFile.name}, ID: ${newFile.id}`)
+      
+      // Use callback to add to existing files
+      onFilesChange((prevFiles: UploadedFile[]) => {
+        console.log(`[UPLOAD] Adding session file to ${prevFiles.length} existing files`)
+        const updatedFiles = [...prevFiles, newFile]
+        console.log(`[UPLOAD] Updated files count: ${updatedFiles.length}`)
+        return updatedFiles
+      })
     }
   }
 

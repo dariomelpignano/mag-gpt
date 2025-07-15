@@ -220,6 +220,8 @@ export async function POST(request: NextRequest) {
     const formData = await request.formData()
     const file = formData.get('file') as File
     const contextMode = formData.get('contextMode') as string | null
+    const streamProgress = formData.get('streamProgress') as string | null // New parameter for progress streaming
+    
     if (!file) {
       return NextResponse.json({ error: 'Nessun file caricato' }, { status: 400 })
     }
@@ -246,9 +248,89 @@ export async function POST(request: NextRequest) {
         contextMode: contextMode || 'session'
       }
     })
-    console.log(`[UPLOAD] Processando file: ${file.name} (${file.type}, ${file.size} bytes) [mode: ${contextMode}]`)
+    console.log(`[UPLOAD] Processando file: ${file.name} (${file.type}, ${file.size} bytes) [mode: ${contextMode}] [stream: ${streamProgress}]`)
     const buffer = Buffer.from(await file.arrayBuffer())
     let extractedText = ''
+
+    // For large PDFs with streaming enabled, use SSE
+    if (streamProgress === 'true' && file.type === 'application/pdf' && file.size > 10 * 1024 * 1024) {
+      const encoder = new TextEncoder()
+      const stream = new ReadableStream({
+        start(controller) {
+          const progressCallback = (progress: { currentPage: number, totalPages: number, status: string }) => {
+            const data = `data: ${JSON.stringify({ type: 'progress', ...progress })}\n\n`
+            controller.enqueue(encoder.encode(data))
+          }
+
+          // Process the PDF with progress updates
+          extractTextFromPDFWithOCR(buffer, progressCallback)
+            .then(async (text) => {
+              extractedText = text
+              
+              // Chunking and vectorization placeholder
+              const chunked = [extractedText]
+              const vectors: any[] = []
+
+              // Save file if context mode
+              let result: any = {
+                success: true,
+                fileName: file.name,
+                fileSize: file.size,
+                fileType: file.type,
+                characterCount: extractedText.length,
+                contextSaved: false,
+                extractedText: extractedText
+              }
+
+              if (contextMode === 'context' && user !== 'unknown') {
+                const username = user.split('@')[0]
+                const contextDir = path.join(process.cwd(), 'context', username)
+                if (!existsSync(contextDir)) {
+                  mkdirSync(contextDir, { recursive: true })
+                }
+                const timestamp = Date.now()
+                const baseName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_')
+                const outPath = path.join(contextDir, `${timestamp}_${baseName}.json`)
+                writeFileSync(outPath, JSON.stringify({
+                  fileName: file.name,
+                  fileType: file.type,
+                  fileSize: file.size,
+                  chunked,
+                  vectors,
+                  uploadedAt: new Date().toISOString()
+                }, null, 2), 'utf-8')
+                
+                result.contextSaved = true
+                result.contextPath = outPath
+              }
+
+              // Send final result
+              const finalData = `data: ${JSON.stringify({ type: 'complete', result })}\n\n`
+              controller.enqueue(encoder.encode(finalData))
+              controller.close()
+            })
+            .catch((error) => {
+              console.error('[UPLOAD] Error during streaming processing:', error)
+              const errorData = `data: ${JSON.stringify({ 
+                type: 'error', 
+                error: `Errore nell'analisi del PDF: ${error instanceof Error ? error.message : 'Errore sconosciuto'}`
+              })}\n\n`
+              controller.enqueue(encoder.encode(errorData))
+              controller.close()
+            })
+        }
+      })
+
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        },
+      })
+    }
+
+    // Normal processing for non-streaming uploads
     // Estrai testo in base al tipo di file
     switch (file.type) {
       case 'application/pdf':
@@ -262,7 +344,7 @@ export async function POST(request: NextRequest) {
               error: `Errore nell'analisi del PDF: ${error instanceof Error ? error.message : 'Errore sconosciuto'}`,
               errorType: 'PDF_ERROR'
             },
-            { status: 400 }
+            { status: 500 }
           )
         }
         break
