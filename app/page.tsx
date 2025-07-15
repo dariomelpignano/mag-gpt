@@ -9,22 +9,61 @@ import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
-import { Send, Bot, User, Trash2, Copy, Check, Paperclip, ChevronDown, ChevronUp, FileText, LogOut } from "lucide-react"
+import { Send, Bot, User, Trash2, Copy, Check, Paperclip, ChevronDown, ChevronUp, FileText, LogOut, Settings, RefreshCw } from "lucide-react"
 import { FileUpload, UploadedFile } from "@/components/file-upload"
 import { ThemeToggle } from "@/components/theme-toggle"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 
 export default function ChatApp() {
   const { messages, input, handleInputChange, setMessages } = useChat()
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
   const [userEmail, setUserEmail] = useState<string>("")
+  const [availableModels, setAvailableModels] = useState<string[]>([])
+  const [selectedModel, setSelectedModel] = useState<string>("")
+  const [modelsLoading, setModelsLoading] = useState(true)
+  const [lastModelsRefresh, setLastModelsRefresh] = useState<Date | null>(null)
 
   // Debug log for uploaded files
   useEffect(() => {
     console.log('[PAGE] Uploaded files updated:', uploadedFiles.length, uploadedFiles.map(f => f.name))
   }, [uploadedFiles])
 
-  // Get user info on load
+  // Function to fetch available models
+  const fetchModels = async () => {
+    try {
+      setModelsLoading(true)
+      const response = await fetch('/api/models')
+      if (response.ok) {
+        const data = await response.json()
+        setAvailableModels(data.models || [])
+        
+        // Only set default model if no model is currently selected
+        if (!selectedModel) {
+          setSelectedModel(data.defaultModel || data.models[0] || "")
+        }
+        
+        if (data.fallback) {
+          console.warn('Using fallback models:', data.error)
+        }
+        
+        setLastModelsRefresh(new Date())
+      }
+    } catch (error) {
+      console.error('Failed to get available models:', error)
+      // Fallback models if fetch fails
+      const fallbackModels = ['google/gemma-3-27b', 'qwen/qwen3-235b-a22b:2']
+      setAvailableModels(fallbackModels)
+      if (!selectedModel) {
+        setSelectedModel(fallbackModels[0])
+      }
+      setLastModelsRefresh(new Date())
+    } finally {
+      setModelsLoading(false)
+    }
+  }
+
+  // Get user info and models on load
   useEffect(() => {
     const fetchUserInfo = async () => {
       try {
@@ -32,13 +71,39 @@ export default function ChatApp() {
         if (response.ok) {
           const data = await response.json()
           setUserEmail(data.user?.email || "")
+          // Refresh models when user is authenticated
+          await fetchModels()
         }
       } catch (error) {
         console.error('Failed to get user info:', error)
+        // Still try to fetch models even if user info fails
+        await fetchModels()
       }
     }
     fetchUserInfo()
   }, [])
+
+  // Refresh models when the window gains focus (user switches back to the app)
+  useEffect(() => {
+    const handleFocus = () => {
+      // Only refresh if user is authenticated and not currently loading
+      if (userEmail && !modelsLoading) {
+        console.log('Window gained focus, refreshing models...')
+        fetchModels()
+      }
+    }
+
+    window.addEventListener('focus', handleFocus)
+    return () => window.removeEventListener('focus', handleFocus)
+  }, [userEmail, modelsLoading])
+
+  // Refresh models when user email changes (after login/logout)
+  useEffect(() => {
+    if (userEmail) {
+      console.log('User logged in, refreshing models...')
+      fetchModels()
+    }
+  }, [userEmail])
 
   // Funzione per aggiornare i file che supporta sia array che callback
   const updateUploadedFiles = (newFiles: UploadedFile[] | ((prev: UploadedFile[]) => UploadedFile[])) => {
@@ -152,7 +217,8 @@ export default function ChatApp() {
           },
           body: JSON.stringify({
             messages: [{ role: 'user', content: userMessage }],
-            uploadedFiles: uploadedFiles
+            uploadedFiles: uploadedFiles,
+            model: selectedModel
           }),
         })
 
@@ -243,6 +309,44 @@ export default function ChatApp() {
             </div>
           </div>
           <div className="flex items-center space-x-3">
+            {/* Model Selector */}
+            <div className="flex items-center space-x-2">
+              <Settings className="w-4 h-4 text-gray-500 dark:text-gray-400" />
+              <Select 
+                value={selectedModel} 
+                onValueChange={setSelectedModel} 
+                disabled={modelsLoading || isStreaming}
+                onOpenChange={(open) => {
+                  // Refresh models when dropdown is opened
+                  if (open && !modelsLoading) {
+                    console.log('Model selector opened, refreshing models...')
+                    fetchModels()
+                  }
+                }}
+              >
+                <SelectTrigger className="w-48 h-8 text-xs">
+                  <SelectValue placeholder={modelsLoading ? "Loading models..." : "Select model"} />
+                </SelectTrigger>
+                <SelectContent>
+                  {availableModels.map((model) => (
+                    <SelectItem key={model} value={model} className="text-xs">
+                      {model}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={fetchModels}
+                disabled={modelsLoading || isStreaming}
+                className="h-8 px-2"
+                title="Refresh available models"
+              >
+                <RefreshCw className={`w-3 h-3 ${modelsLoading ? 'animate-spin' : ''}`} />
+              </Button>
+            </div>
+
             {/* User Info */}
             <div className="hidden sm:flex items-center space-x-2 text-sm text-gray-600 dark:text-gray-300">
               <User className="w-4 h-4" />
@@ -499,8 +603,15 @@ export default function ChatApp() {
           </form>
           <div className="flex items-center justify-between mt-2">
             <p className="text-xs text-gray-500 dark:text-gray-400">
-              gemma-3-27b is running locally on LM Studio on a monster server provided by Neosurance.
-          </p>
+              {selectedModel || "No model selected"} is running locally on LM Studio at 192.168.97.3:5002 on Dragoneos server.
+              {lastModelsRefresh && (
+                <span className="ml-2">
+                  • Models refreshed at {lastModelsRefresh.toLocaleTimeString()}
+                </span>
+              )}
+              <br />
+              🧠 Vector embeddings with text-embedding-nomic-embed-text-v2-moe for semantic search
+            </p>
           </div>
         </div>
       </div>

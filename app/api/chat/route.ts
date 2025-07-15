@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server'
 import { ChatOpenAI } from '@langchain/openai'
 import { PromptTemplate } from '@langchain/core/prompts'
+import { generateChunkEmbeddings, findRelevantChunks } from '@/lib/embeddings'
 
 // Funzione per dividere il testo in chunk
 function chunkText(text: string, chunkSize: number = 1000, overlap: number = 200): string[] {
@@ -40,54 +41,90 @@ function chunkText(text: string, chunkSize: number = 1000, overlap: number = 200
   return chunks.filter(chunk => chunk.length > 50) // Rimuovi chunk troppo piccoli
 }
 
-// Funzione per calcolare similarità semantica semplice (basata su parole chiave)
-function calculateSimilarity(query: string, chunk: string): number {
-  const queryWords = query.toLowerCase().split(/\s+/).filter(word => word.length > 3)
-  const chunkWords = chunk.toLowerCase().split(/\s+/).filter(word => word.length > 3)
-  
-  let matches = 0
-  for (const queryWord of queryWords) {
-    if (chunkWords.some(chunkWord => chunkWord.includes(queryWord) || queryWord.includes(chunkWord))) {
-      matches++
-    }
+// Cache per gli embeddings per evitare ricalcoli
+const embeddingsCache = new Map<string, { 
+  embeddings: any, 
+  timestamp: number,
+  contentHash: string 
+}>()
+
+// Cache validity: 1 hour
+const CACHE_VALIDITY_MS = 60 * 60 * 1000
+
+function simpleHash(str: string): string {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i)
+    hash = ((hash << 5) - hash) + char
+    hash = hash & hash // Convert to 32-bit integer
   }
-  
-  return matches / Math.max(queryWords.length, 1)
+  return Math.abs(hash).toString(36)
 }
 
-// Funzione per recuperare i chunk più rilevanti
-function retrieveRelevantChunks(query: string, fileChunks: { fileName: string, chunks: string[] }[], topK: number = 3): string[] {
-  const allChunks: { chunk: string, fileName: string, similarity: number }[] = []
+function getCacheKey(fileChunks: { fileName: string, chunks: string[] }[]): { key: string, contentHash: string } {
+  // Create content hash based on actual chunk content
+  const contentForHashing = fileChunks
+    .map(file => `${file.fileName}:${file.chunks.join('')}`)
+    .sort()
+    .join('|')
   
-  for (const file of fileChunks) {
-    for (const chunk of file.chunks) {
-      const similarity = calculateSimilarity(query, chunk)
-      allChunks.push({ chunk, fileName: file.fileName, similarity })
+  const contentHash = simpleHash(contentForHashing)
+  
+  // Create cache key based on file names and chunk count
+  const key = fileChunks
+    .map(file => `${file.fileName}:${file.chunks.length}`)
+    .sort()
+    .join('|')
+    
+  return { key, contentHash }
+}
+
+function isCacheValid(cacheEntry: { embeddings: any, timestamp: number, contentHash: string }, contentHash: string): boolean {
+  const now = Date.now()
+  const isTimeValid = (now - cacheEntry.timestamp) < CACHE_VALIDITY_MS
+  const isContentValid = cacheEntry.contentHash === contentHash
+  
+  return isTimeValid && isContentValid
+}
+
+// Cleanup expired cache entries periodically
+function cleanupCache() {
+  const now = Date.now()
+  let removedCount = 0
+  
+  for (const [key, entry] of embeddingsCache.entries()) {
+    if ((now - entry.timestamp) >= CACHE_VALIDITY_MS) {
+      embeddingsCache.delete(key)
+      removedCount++
     }
   }
   
-  // Ordina per similarità e prendi i top K
-  return allChunks
-    .sort((a, b) => b.similarity - a.similarity)
-    .slice(0, topK)
-    .map(item => `[${item.fileName}]\n${item.chunk}`)
+  if (removedCount > 0) {
+    console.log(`[EMBEDDINGS] Cleaned up ${removedCount} expired cache entries`)
+  }
 }
+
+// Run cleanup every 30 minutes
+setInterval(cleanupCache, 30 * 60 * 1000)
 
 export async function POST(request: NextRequest) {
   try {
-    const { messages, uploadedFiles } = await request.json()
+    const { messages, uploadedFiles, model } = await request.json()
     
     if (!messages || messages.length === 0) {
       return new Response('No messages provided', { status: 400 })
     }
 
+    // Use provided model or default to gemma-3-27b
+    const selectedModel = model || 'google/gemma-3-27b'
+
     const lastMessage = messages[messages.length - 1]
     const userQuery = lastMessage.content
 
-    // Sistema RAG: chunking e retrieval
+    // Sistema RAG: chunking e retrieval con embeddings
     let context = ''
     if (uploadedFiles && uploadedFiles.length > 0) {
-      console.log('[RAG] Processing', uploadedFiles.length, 'files for retrieval')
+      console.log('[RAG] Processing', uploadedFiles.length, 'files for retrieval with embeddings')
       
       // Dividi ogni file in chunk
       const fileChunks = uploadedFiles.map((file: any) => ({
@@ -95,14 +132,58 @@ export async function POST(request: NextRequest) {
         chunks: chunkText(file.content, 800, 150) // Chunk più piccoli per precisione
       }))
       
-      // Recupera i chunk più rilevanti
-      const relevantChunks = retrieveRelevantChunks(userQuery, fileChunks, 4)
-      
-      if (relevantChunks.length > 0) {
-        context = `\n\nRelevant context from uploaded files:\n${relevantChunks.join('\n\n---\n\n')}`
-        console.log('[RAG] Retrieved', relevantChunks.length, 'relevant chunks')
-      } else {
-        console.log('[RAG] No relevant chunks found')
+      try {
+        // Check cache for embeddings
+        const { key: cacheKey, contentHash } = getCacheKey(fileChunks)
+        const cacheEntry = embeddingsCache.get(cacheKey)
+        let chunksWithEmbeddings
+        
+        if (cacheEntry && isCacheValid(cacheEntry, contentHash)) {
+          console.log('[RAG] Using cached embeddings')
+          chunksWithEmbeddings = cacheEntry.embeddings
+        } else {
+          console.log('[RAG] Generating new embeddings...')
+          chunksWithEmbeddings = await generateChunkEmbeddings(fileChunks)
+          
+          // Update cache with new embeddings
+          embeddingsCache.set(cacheKey, {
+            embeddings: chunksWithEmbeddings,
+            timestamp: Date.now(),
+            contentHash: contentHash
+          })
+          console.log('[RAG] Embeddings cached for future use')
+        }
+        
+        // Recupera i chunk più rilevanti usando similarità vettoriale
+        const relevantChunks = await findRelevantChunks(userQuery, chunksWithEmbeddings, 4)
+        
+        if (relevantChunks.length > 0) {
+          context = `\n\nRelevant context from uploaded files:\n${relevantChunks.join('\n\n---\n\n')}`
+          console.log('[RAG] Retrieved', relevantChunks.length, 'relevant chunks using vector similarity')
+        } else {
+          console.log('[RAG] No relevant chunks found')
+        }
+      } catch (error) {
+        console.error('[RAG] Error in embeddings processing:', error)
+        console.log('[RAG] Falling back to simple text search')
+        
+        // Fallback to simple keyword matching if embeddings fail
+        const allChunks: { chunk: string, fileName: string }[] = []
+        for (const file of fileChunks) {
+          for (const chunk of file.chunks) {
+            allChunks.push({ chunk, fileName: file.fileName })
+          }
+        }
+        
+        // Simple fallback: take first few chunks
+        const fallbackChunks = allChunks
+          .slice(0, 4)
+          .map(item => `[${item.fileName}]\n${item.chunk}`)
+        
+        if (fallbackChunks.length > 0) {
+          context = `\n\nRelevant context from uploaded files:\n${fallbackChunks.join('\n\n---\n\n')}`
+          console.log('[RAG] Using fallback chunks:', fallbackChunks.length)
+        }
       }
     }
 
@@ -124,16 +205,16 @@ Please provide a clear, accurate, and helpful response. If the context doesn't c
 `)
 
     // LM Studio configuration
-    const model = new ChatOpenAI({
+    const llmModel = new ChatOpenAI({
       openAIApiKey: 'not-needed', // LM Studio doesn't require a real API key
       configuration: {
-        baseURL: 'http://localhost:1234/v1',
+        baseURL: 'http://192.168.97.3:5002/v1',
       },
-      modelName: 'google/gemma-3-27b', // Your downloaded Gemma 3 27B model
+      modelName: selectedModel,
       temperature: 0.1, // Più deterministico per risposte precise
     })
 
-    const chain = prompt.pipe(model)
+    const chain = prompt.pipe(llmModel)
 
     const formattedPrompt = await prompt.format({
       context: context || 'No specific context provided.',
@@ -141,7 +222,7 @@ Please provide a clear, accurate, and helpful response. If the context doesn't c
     })
 
     // Streaming response
-    const stream = await model.stream(formattedPrompt)
+    const stream = await llmModel.stream(formattedPrompt)
     
     const encoder = new TextEncoder()
     
