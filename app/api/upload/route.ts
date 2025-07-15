@@ -11,6 +11,9 @@ import { existsSync, mkdirSync, writeFileSync } from 'fs'
 
 const execAsync = promisify(exec)
 
+// Global map to track active upload cancellations
+const activeUploads = new Map<string, { cancelled: boolean, controller: AbortController }>()
+
 // Funzione per estrarre testo da PDF usando pdf2json
 async function extractTextFromPDF(buffer: Buffer): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -104,16 +107,16 @@ async function convertPDFToImages(pdfPath: string, outputDir: string): Promise<s
 async function extractTextFromScannedPDF(
   buffer: Buffer, 
   progressCallback?: (progress: { currentPage: number, totalPages: number, status: string }) => void,
-  request?: NextRequest
+  uploadId?: string
 ): Promise<string> {
   let tempDir: string | null = null
   
   try {
-    console.log('[UPLOAD] Avvio OCR per PDF scansionato...')
+    console.log('[UPLOAD] Avvio OCR per PDF scannionato...')
     progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Preparing PDF for OCR...' })
     
-    // Check if request was cancelled
-    if (request?.signal?.aborted) {
+    // Check if upload was cancelled
+    if (uploadId && activeUploads.get(uploadId)?.cancelled) {
       throw new Error('Request cancelled')
     }
     
@@ -129,7 +132,7 @@ async function extractTextFromScannedPDF(
     progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Converting PDF to images...' })
     
     // Check cancellation again before expensive operation
-    if (request?.signal?.aborted) {
+    if (uploadId && activeUploads.get(uploadId)?.cancelled) {
       throw new Error('Request cancelled')
     }
     
@@ -179,21 +182,56 @@ async function extractTextFromScannedPDF(
     // Processa ogni immagine con OCR
     for (let i = 0; i < imagePaths.length; i++) {
       // Check for cancellation before processing each page
-      if (request?.signal?.aborted) {
-        console.log(`[UPLOAD] Request cancelled, stopping OCR at page ${i + 1}/${totalPages}`)
+      if (uploadId && activeUploads.get(uploadId)?.cancelled) {
+        console.log(`[UPLOAD:${uploadId}] Request cancelled, stopping OCR at page ${i + 1}/${totalPages}`)
         throw new Error('Request cancelled')
       }
       
       const imagePath = imagePaths[i]
       const currentPage = i + 1
-      console.log(`[UPLOAD] OCR pagina ${currentPage}/${totalPages}...`)
+      console.log(`[UPLOAD:${uploadId}] OCR pagina ${currentPage}/${totalPages}...`)
       progressCallback?.({ currentPage, totalPages, status: `Processing page ${currentPage} of ${totalPages}...` })
       
       try {
-        const pageText = await tesseract.recognize(imagePath, tesseractConfig)
+        // Check cancellation before each OCR operation
+        if (uploadId && activeUploads.get(uploadId)?.cancelled) {
+          console.log(`[UPLOAD] Request cancelled during OCR of page ${currentPage}`)
+          throw new Error('Request cancelled')
+        }
+        
+        // Create a promise wrapper that can be cancelled mid-OCR
+        const ocrPromise = tesseract.recognize(imagePath, tesseractConfig)
+        
+        // Check for cancellation every 100ms during OCR
+        const cancellationChecker = setInterval(() => {
+          if (uploadId && activeUploads.get(uploadId)?.cancelled) {
+            console.log(`[UPLOAD] Request cancelled during OCR operation on page ${currentPage}`)
+            clearInterval(cancellationChecker)
+            // Note: We can't actually cancel tesseract mid-operation, but we'll catch it in the next check
+          }
+        }, 100)
+        
+        const pageText = await ocrPromise
+        clearInterval(cancellationChecker)
+        
+        // Check cancellation immediately after OCR completes
+        if (uploadId && activeUploads.get(uploadId)?.cancelled) {
+          console.log(`[UPLOAD] Request cancelled after OCR completed on page ${currentPage}`)
+          throw new Error('Request cancelled')
+        }
+        
         fullText += pageText.trim() + '\n\n'
-        console.log(`[UPLOAD] Pagina ${currentPage}: estratti ${pageText.trim().length} caratteri`)
+        console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: estratti ${pageText.trim().length} caratteri`)
+        
+        // Check cancellation after processing each page result
+        if (uploadId && activeUploads.get(uploadId)?.cancelled) {
+          console.log(`[UPLOAD] Request cancelled after processing page ${currentPage} result`)
+          throw new Error('Request cancelled')
+        }
       } catch (pageError) {
+        if (pageError instanceof Error && pageError.message === 'Request cancelled') {
+          throw pageError
+        }
         console.warn(`[UPLOAD] Errore OCR pagina ${currentPage}:`, pageError)
         fullText += `[Errore nell'elaborazione della pagina ${currentPage}]\n\n`
       }
@@ -223,6 +261,14 @@ async function extractTextFromScannedPDF(
         console.warn('[UPLOAD] Errore pulizia file temporanei:', cleanupError)
       }
     }
+    
+    // Clean up tracking for this upload (but only if not cancelled - cancelled uploads clean up later)
+    if (uploadId) {
+      const uploadInfo = activeUploads.get(uploadId)
+      if (!uploadInfo?.cancelled) {
+        activeUploads.delete(uploadId)
+      }
+    }
   }
 }
 
@@ -230,7 +276,7 @@ async function extractTextFromScannedPDF(
 async function extractTextFromPDFWithOCR(
   buffer: Buffer, 
   progressCallback?: (progress: { currentPage: number, totalPages: number, status: string }) => void,
-  request?: NextRequest
+  uploadId?: string
 ): Promise<string> {
   try {
     // Prima prova con pdf2json
@@ -238,7 +284,7 @@ async function extractTextFromPDFWithOCR(
     progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Trying text extraction...' })
     
     // Check cancellation before starting
-    if (request?.signal?.aborted) {
+    if (uploadId && activeUploads.get(uploadId)?.cancelled) {
       throw new Error('Request cancelled')
     }
     
@@ -248,18 +294,19 @@ async function extractTextFromPDFWithOCR(
     return text
   } catch (error) {
     // Check cancellation before fallback
-    if (request?.signal?.aborted) {
+    if (uploadId && activeUploads.get(uploadId)?.cancelled) {
       throw new Error('Request cancelled')
     }
     
-    if (error instanceof Error && error.message === 'SCANNED_PDF') {
-      console.log('[UPLOAD] Rilevato PDF scansionato, avvio OCR...')
-      // Se è un PDF scansionato, usa OCR
-      return await extractTextFromScannedPDF(buffer, progressCallback, request)
+    if (error instanceof Error && (error.message === 'SCANNED_PDF' || error.message.includes('PDF non ha pagine leggibili'))) {
+      console.log('[UPLOAD] PDF è scansionato, uso OCR')
+      progressCallback?.({ currentPage: 0, totalPages: 0, status: 'PDF appears to be scanned, using OCR...' })
+      return await extractTextFromScannedPDF(buffer, progressCallback, uploadId)
     } else {
-      console.log('[UPLOAD] pdf2json fallito, tentativo OCR come fallback...')
-      // Se pdf2json fallisce per altri motivi, prova comunque OCR
-      return await extractTextFromScannedPDF(buffer, progressCallback, request)
+      console.warn('[UPLOAD] Errore pdf2json:', error)
+      console.log('[UPLOAD] Fallback a OCR')
+      progressCallback?.({ currentPage: 0, totalPages: 0, status: 'Text extraction failed, trying OCR...' })
+      return await extractTextFromScannedPDF(buffer, progressCallback, uploadId)
     }
   }
 }
@@ -295,6 +342,12 @@ export async function POST(request: NextRequest) {
     if (!file) {
       return NextResponse.json({ error: 'Nessun file caricato' }, { status: 400 })
     }
+    
+    // Generate unique upload ID for this request
+    const uploadId = `upload_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    
+    // Register this upload in our tracking system
+    activeUploads.set(uploadId, { cancelled: false, controller: new AbortController() })
     // File size check (200MB limit)
     const MAX_SIZE = 200 * 1024 * 1024
     if (file.size > MAX_SIZE) {
@@ -327,13 +380,22 @@ export async function POST(request: NextRequest) {
       const encoder = new TextEncoder()
       const stream = new ReadableStream({
         start(controller) {
+          let controllerClosed = false
+          
           const progressCallback = (progress: { currentPage: number, totalPages: number, status: string }) => {
-            const data = `data: ${JSON.stringify({ type: 'progress', ...progress })}\n\n`
-            controller.enqueue(encoder.encode(data))
+            if (controllerClosed) return // Don't try to write to closed controller
+            
+            try {
+              const data = `data: ${JSON.stringify({ type: 'progress', ...progress, uploadId })}\n\n`
+              controller.enqueue(encoder.encode(data))
+            } catch (error) {
+              console.warn('[UPLOAD] Failed to send progress update (controller likely closed):', error)
+              controllerClosed = true
+            }
           }
 
           // Process the PDF with progress updates
-          extractTextFromPDFWithOCR(buffer, progressCallback, request)
+          extractTextFromPDFWithOCR(buffer, progressCallback, uploadId)
             .then(async (text) => {
               extractedText = text
               
@@ -375,29 +437,53 @@ export async function POST(request: NextRequest) {
               }
 
               // Send final result
-              const finalData = `data: ${JSON.stringify({ type: 'complete', result })}\n\n`
-              controller.enqueue(encoder.encode(finalData))
-              controller.close()
+              if (!controllerClosed) {
+                try {
+                  const finalData = `data: ${JSON.stringify({ type: 'complete', result })}\n\n`
+                  controller.enqueue(encoder.encode(finalData))
+                  controller.close()
+                  controllerClosed = true
+                } catch (error) {
+                  console.warn('[UPLOAD] Failed to send completion message (controller likely closed):', error)
+                  controllerClosed = true
+                }
+              }
             })
             .catch((error) => {
               console.error('[UPLOAD] Error during streaming processing:', error)
               
-              // Check if it's a cancellation
-              if (error instanceof Error && error.message === 'Request cancelled') {
-                const cancelData = `data: ${JSON.stringify({ 
-                  type: 'cancelled', 
-                  message: 'Upload cancelled'
-                })}\n\n`
-                controller.enqueue(encoder.encode(cancelData))
-              } else {
-                const errorData = `data: ${JSON.stringify({ 
-                  type: 'error', 
-                  error: `Errore nell'analisi del PDF: ${error instanceof Error ? error.message : 'Errore sconosciuto'}`
-                })}\n\n`
-                controller.enqueue(encoder.encode(errorData))
+              if (!controllerClosed) {
+                try {
+                  // Check if it's a cancellation
+                  if (error instanceof Error && error.message === 'Request cancelled') {
+                    const cancelData = `data: ${JSON.stringify({ 
+                      type: 'cancelled', 
+                      message: 'Upload cancelled'
+                    })}\n\n`
+                    controller.enqueue(encoder.encode(cancelData))
+                  } else {
+                    const errorData = `data: ${JSON.stringify({ 
+                      type: 'error', 
+                      error: `Errore nell'analisi del PDF: ${error instanceof Error ? error.message : 'Errore sconosciuto'}`
+                    })}\n\n`
+                    controller.enqueue(encoder.encode(errorData))
+                  }
+                  controller.close()
+                  controllerClosed = true
+                } catch (controllerError) {
+                  console.warn('[UPLOAD] Failed to send error message (controller likely closed):', controllerError)
+                  controllerClosed = true
+                }
               }
-              controller.close()
             })
+        },
+        cancel() {
+          // When the client disconnects/cancels the stream
+          console.log(`[UPLOAD] Client disconnected, marking upload ${uploadId} as cancelled`)
+          const uploadInfo = activeUploads.get(uploadId)
+          if (uploadInfo) {
+            uploadInfo.cancelled = true
+          }
         }
       })
 
@@ -413,9 +499,9 @@ export async function POST(request: NextRequest) {
     // Normal processing for non-streaming uploads
     // Estrai testo in base al tipo di file
     switch (file.type) {
-      case 'application/pdf':
-        try {
-          extractedText = await extractTextFromPDFWithOCR(buffer, undefined, request)
+              case 'application/pdf':
+          try {
+            extractedText = await extractTextFromPDFWithOCR(buffer, undefined, uploadId)
           console.log(`[UPLOAD] Successo! Testo estratto: ${extractedText.length} caratteri`)
         } catch (error) {
           console.error('[UPLOAD] Errore estrazione PDF:', error)
@@ -501,6 +587,50 @@ export async function POST(request: NextRequest) {
         errorType: 'GENERAL_ERROR',
         details: error instanceof Error ? error.message : String(error)
       },
+      { status: 500 }
+    )
+  }
+} 
+
+export async function DELETE(request: NextRequest) {
+  try {
+    const { searchParams } = new URL(request.url)
+    const uploadId = searchParams.get('uploadId')
+    
+    if (!uploadId) {
+      return NextResponse.json({ error: 'Upload ID is required' }, { status: 400 })
+    }
+    
+    console.log(`[UPLOAD] Cancelling upload: ${uploadId}`)
+    console.log(`[UPLOAD] Active uploads before cancellation:`, Array.from(activeUploads.keys()))
+    
+    // Mark the upload as cancelled
+    const uploadInfo = activeUploads.get(uploadId)
+    if (uploadInfo) {
+      uploadInfo.cancelled = true
+      uploadInfo.controller.abort()
+      console.log(`[UPLOAD] Upload ${uploadId} marked as cancelled`)
+      
+      // Clean up after a delay to allow for proper error handling
+      setTimeout(() => {
+        activeUploads.delete(uploadId)
+        console.log(`[UPLOAD] Upload ${uploadId} cleaned up from tracking`)
+        console.log(`[UPLOAD] Remaining active uploads:`, Array.from(activeUploads.keys()))
+      }, 10000) // Increased delay to ensure all operations see the cancellation
+    } else {
+      console.log(`[UPLOAD] Upload ${uploadId} not found in active uploads`)
+      console.log(`[UPLOAD] Current active uploads:`, Array.from(activeUploads.keys()))
+    }
+    
+    return NextResponse.json({ 
+      success: true, 
+      message: 'Upload cancellation requested',
+      uploadId 
+    })
+  } catch (error) {
+    console.error('[UPLOAD] Error cancelling upload:', error)
+    return NextResponse.json(
+      { error: 'Failed to cancel upload' },
       { status: 500 }
     )
   }

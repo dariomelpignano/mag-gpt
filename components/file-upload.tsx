@@ -52,8 +52,10 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
     currentPage: number
     totalPages: number
     status: string
+    uploadId?: string
   } | null>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
+  const currentUploadIdRef = useRef<string | null>(null)
 
   // Debug log for files prop
   useEffect(() => {
@@ -67,12 +69,28 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
     }
   }, [uploadError])
 
-  const cancelUpload = () => {
+  const cancelUpload = async () => {
     console.log('[UPLOAD] Cancelling upload...')
+    
+    // Cancel via backend if we have an upload ID
+    if (currentUploadIdRef.current) {
+      try {
+        await fetch(`/api/upload?uploadId=${currentUploadIdRef.current}`, {
+          method: 'DELETE'
+        })
+        console.log(`[UPLOAD] Backend cancellation requested for ${currentUploadIdRef.current}`)
+      } catch (error) {
+        console.warn('[UPLOAD] Failed to cancel upload on backend:', error)
+      }
+      currentUploadIdRef.current = null
+    }
+    
+    // Cancel frontend request
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
       abortControllerRef.current = null
     }
+    
     setIsUploading(false)
     setUploadProgress(null)
     setUploadError('Upload cancelled by user')
@@ -183,6 +201,7 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
 
             if (done) {
               setUploadProgress(null)
+              currentUploadIdRef.current = null
               resolve()
               return
             }
@@ -196,23 +215,33 @@ export function FileUpload({ files, onFilesChange, disabled = false, removeFile 
                   const data = JSON.parse(line.slice(6))
                   
                   if (data.type === 'progress') {
+                    // Store upload ID for cancellation
+                    if (data.uploadId && !currentUploadIdRef.current) {
+                      currentUploadIdRef.current = data.uploadId
+                      console.log(`[UPLOAD] Stored upload ID: ${data.uploadId}`)
+                    }
+                    
                     setUploadProgress({
                       fileName: file.name,
                       currentPage: data.currentPage,
                       totalPages: data.totalPages,
-                      status: data.status
+                      status: data.status,
+                      uploadId: data.uploadId
                     })
                   } else if (data.type === 'complete') {
                     setUploadProgress(null)
+                    currentUploadIdRef.current = null
                     handleUploadComplete(data.result, contextMode, index)
                     resolve()
                     return
                   } else if (data.type === 'cancelled') {
                     setUploadProgress(null)
+                    currentUploadIdRef.current = null
                     reject(new Error('Upload cancelled'))
                     return
                   } else if (data.type === 'error') {
                     setUploadProgress(null)
+                    currentUploadIdRef.current = null
                     reject(new Error(data.error))
                     return
                   }
