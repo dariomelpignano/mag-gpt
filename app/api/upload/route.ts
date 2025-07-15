@@ -78,7 +78,8 @@ async function convertPDFToImages(pdfPath: string, outputDir: string): Promise<s
   try {
     // Usa pdftoppm con parametri ottimizzati per OCR LSTM
     // 300 DPI è ottimale per Tesseract LSTM (migliore di 200 per testi piccoli)
-    const command = `pdftoppm -jpeg -r 300 -jpegopt quality=95 "${pdfPath}" "${path.join(outputDir, 'page')}"`
+    // Aggiungiamo opzioni per migliorare la qualità dell'immagine
+    const command = `pdftoppm -jpeg -r 300 -jpegopt quality=95 -aa yes -aaVector yes "${pdfPath}" "${path.join(outputDir, 'page')}"`
     console.log(`[UPLOAD] Eseguendo comando: ${command}`)
     
     const { stdout, stderr } = await execAsync(command)
@@ -94,7 +95,18 @@ async function convertPDFToImages(pdfPath: string, outputDir: string): Promise<s
       .sort()
       .map(file => path.join(outputDir, file))
     
-    console.log(`[UPLOAD] Generati ${imageFiles.length} file immagine a 300 DPI`)
+    console.log(`[UPLOAD] Generati ${imageFiles.length} file immagine a 300 DPI con anti-aliasing`)
+    
+    // Log delle dimensioni dei primi file per diagnostica
+    if (imageFiles.length > 0) {
+      try {
+        const firstImageStats = await fs.stat(imageFiles[0])
+        console.log(`[UPLOAD] Prima immagine: ${imageFiles[0]}, dimensione: ${(firstImageStats.size / 1024).toFixed(1)} KB`)
+      } catch (statError) {
+        console.warn('[UPLOAD] Impossibile leggere stats prima immagine:', statError)
+      }
+    }
+    
     return imageFiles
     
   } catch (error) {
@@ -177,7 +189,16 @@ async function extractTextFromScannedPDF(
       tessedit_enable_dict_correction: 1, // Dictionary correction
     }
     
+    // Alternative config for problematic documents
+    const fallbackTesseractConfig = {
+      lang: 'ita+eng', // Simplified language set
+      oem: 1, // LSTM only
+      psm: 3, // Fully automatic page segmentation, but no OSD
+    }
+    
     let fullText = ''
+    let consecutiveFailures = 0
+    const maxConsecutiveFailures = 3
     
     // Processa ogni immagine con OCR
     for (let i = 0; i < imagePaths.length; i++) {
@@ -199,7 +220,40 @@ async function extractTextFromScannedPDF(
           throw new Error('Request cancelled')
         }
         
-        const pageText = await tesseract.recognize(imagePath, tesseractConfig)
+        // Try primary config first
+        let pageText = ''
+        let usedFallback = false
+        
+        try {
+          pageText = await tesseract.recognize(imagePath, tesseractConfig)
+          
+          // Check if result looks garbled (too many non-alphabetic characters)
+          const alphaCount = (pageText.match(/[a-zA-Zàèéìíîòóùúäöüß]/g) || []).length
+          const totalCount = pageText.replace(/\s/g, '').length
+          const alphaRatio = totalCount > 0 ? alphaCount / totalCount : 0
+          
+          console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: ratio alfabetico ${(alphaRatio * 100).toFixed(1)}%`)
+          
+          // If less than 30% alphabetic characters, try fallback config
+          if (alphaRatio < 0.3 && totalCount > 50) {
+            console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: testo sembra illeggibile, provo configurazione fallback`)
+            pageText = await tesseract.recognize(imagePath, fallbackTesseractConfig)
+            usedFallback = true
+            
+            // Re-check quality
+            const newAlphaCount = (pageText.match(/[a-zA-Zàèéìíîòóùúäöüß]/g) || []).length
+            const newTotalCount = pageText.replace(/\s/g, '').length
+            const newAlphaRatio = newTotalCount > 0 ? newAlphaCount / newTotalCount : 0
+            console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: fallback ratio alfabetico ${(newAlphaRatio * 100).toFixed(1)}%`)
+          }
+          
+          consecutiveFailures = 0 // Reset failure counter on success
+        } catch (ocrError) {
+          console.warn(`[UPLOAD] Errore OCR principale pagina ${currentPage}:`, ocrError)
+          // Try fallback config
+          pageText = await tesseract.recognize(imagePath, fallbackTesseractConfig)
+          usedFallback = true
+        }
         
         // Single cancellation check after OCR completes - sufficient for responsiveness
         if (uploadId && activeUploads.get(uploadId)?.cancelled) {
@@ -208,13 +262,21 @@ async function extractTextFromScannedPDF(
         }
         
         fullText += pageText.trim() + '\n\n'
-        console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: estratti ${pageText.trim().length} caratteri`)
+        console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: estratti ${pageText.trim().length} caratteri${usedFallback ? ' (fallback)' : ''}`)
+        
       } catch (pageError) {
         if (pageError instanceof Error && pageError.message === 'Request cancelled') {
           throw pageError
         }
         console.warn(`[UPLOAD] Errore OCR pagina ${currentPage}:`, pageError)
         fullText += `[Errore nell'elaborazione della pagina ${currentPage}]\n\n`
+        consecutiveFailures++
+        
+        // If too many consecutive failures, the PDF might be problematic
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          console.warn(`[UPLOAD] Troppe pagine consecutive fallite (${consecutiveFailures}), PDF potrebbe essere di qualità molto bassa`)
+          progressCallback?.({ currentPage, totalPages, status: `Warning: Poor quality PDF detected. Results may be unreliable.` })
+        }
       }
     }
     
