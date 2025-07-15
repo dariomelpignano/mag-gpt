@@ -181,8 +181,8 @@ async function extractTextFromScannedPDF(
     
     // Processa ogni immagine con OCR
     for (let i = 0; i < imagePaths.length; i++) {
-      // Check for cancellation before processing each page
-      if (uploadId && activeUploads.get(uploadId)?.cancelled) {
+      // Check for cancellation before processing each page (but less frequently for performance)
+      if (uploadId && i % 3 === 0 && activeUploads.get(uploadId)?.cancelled) {
         console.log(`[UPLOAD:${uploadId}] Request cancelled, stopping OCR at page ${i + 1}/${totalPages}`)
         throw new Error('Request cancelled')
       }
@@ -199,35 +199,16 @@ async function extractTextFromScannedPDF(
           throw new Error('Request cancelled')
         }
         
-        // Create a promise wrapper that can be cancelled mid-OCR
-        const ocrPromise = tesseract.recognize(imagePath, tesseractConfig)
+        const pageText = await tesseract.recognize(imagePath, tesseractConfig)
         
-        // Check for cancellation every 100ms during OCR
-        const cancellationChecker = setInterval(() => {
-          if (uploadId && activeUploads.get(uploadId)?.cancelled) {
-            console.log(`[UPLOAD] Request cancelled during OCR operation on page ${currentPage}`)
-            clearInterval(cancellationChecker)
-            // Note: We can't actually cancel tesseract mid-operation, but we'll catch it in the next check
-          }
-        }, 100)
-        
-        const pageText = await ocrPromise
-        clearInterval(cancellationChecker)
-        
-        // Check cancellation immediately after OCR completes
+        // Single cancellation check after OCR completes - sufficient for responsiveness
         if (uploadId && activeUploads.get(uploadId)?.cancelled) {
-          console.log(`[UPLOAD] Request cancelled after OCR completed on page ${currentPage}`)
+          console.log(`[UPLOAD:${uploadId}] Request cancelled after page ${currentPage}`)
           throw new Error('Request cancelled')
         }
         
         fullText += pageText.trim() + '\n\n'
         console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: estratti ${pageText.trim().length} caratteri`)
-        
-        // Check cancellation after processing each page result
-        if (uploadId && activeUploads.get(uploadId)?.cancelled) {
-          console.log(`[UPLOAD] Request cancelled after processing page ${currentPage} result`)
-          throw new Error('Request cancelled')
-        }
       } catch (pageError) {
         if (pageError instanceof Error && pageError.message === 'Request cancelled') {
           throw pageError
