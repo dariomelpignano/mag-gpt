@@ -509,8 +509,14 @@ export default function ChatApp() {
               <div className="flex items-center space-x-2">
                 <FileText className="w-4 h-4" />
                 <span>
-                  {uploadedFiles.length} document{uploadedFiles.length !== 1 ? 's' : ''} loaded 
-                  ({Math.round(uploadedFiles.reduce((sum, file) => sum + file.content.length, 0) / 1024)}KB)
+                  {(() => {
+                    const userFiles = uploadedFiles.filter(file => !file.name?.startsWith('[BASE]'))
+                    const baseFiles = uploadedFiles.filter(file => file.name?.startsWith('[BASE]'))
+                    const userFilesSize = Math.round(userFiles.reduce((sum, file) => sum + file.content.length, 0) / 1024)
+                    
+                    return `${userFiles.length} document${userFiles.length !== 1 ? 's' : ''} loaded (${userFilesSize}KB)` +
+                           (baseFiles.length > 0 ? ` + ${baseFiles.length} base` : '')
+                  })()}
                 </span>
               </div>
               {showUploadedFiles ? (
@@ -520,16 +526,20 @@ export default function ChatApp() {
               )}
             </button>
             
-            {showUploadedFiles && (
+            {showUploadedFiles && uploadedFiles.filter(file => !file.name?.startsWith('[BASE]')).length > 0 && (
               <div className="pb-3">
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-                  {uploadedFiles.map((file) => (
+                  {uploadedFiles
+                    .filter(file => !file.name?.startsWith('[BASE]')) // Hide base context files from list
+                    .map((file) => (
                     <div
                       key={file.id}
                       className="flex items-center justify-between p-2 bg-white dark:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600"
                     >
                       <div className="flex items-center space-x-2 min-w-0 flex-1">
-                        <span className={`inline-flex items-center justify-center w-5 h-5 rounded ${file.persistent ? 'bg-blue-500' : 'bg-gray-400'}`}>{/* icon */}<FileText className="w-4 h-4 text-white flex-shrink-0" /></span>
+                        <span className={`inline-flex items-center justify-center w-5 h-5 rounded ${
+                          file.persistent ? 'bg-blue-500' : 'bg-gray-400'
+                        }`}>{/* icon */}<FileText className="w-4 h-4 text-white flex-shrink-0" /></span>
                         <div className="min-w-0 flex-1">
                           <p className="text-xs font-medium text-gray-900 dark:text-gray-100 truncate">
                             {file.name}
@@ -543,6 +553,7 @@ export default function ChatApp() {
                         onClick={() => removeFile(file.id)}
                         className="ml-2 p-1 text-gray-400 hover:text-red-500 transition-colors flex-shrink-0"
                         disabled={isStreaming}
+                        title="Remove file"
                       >
                         <Trash2 className="w-3 h-3" />
                       </button>
