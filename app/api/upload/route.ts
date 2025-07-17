@@ -8,11 +8,52 @@ import { exec } from 'child_process'
 import { promisify } from 'util'
 import { logInteraction } from '@/lib/logger'
 import { existsSync, mkdirSync, writeFileSync } from 'fs'
+import { generateChunkEmbeddings } from '@/lib/embeddings'
+import { getOptimalChunkingConfig } from '@/lib/chunking-config'
+import { chunkWithStrategy } from '@/lib/optimized-chunking'
 
 const execAsync = promisify(exec)
 
 // Global map to track active upload cancellations
 const activeUploads = new Map<string, { cancelled: boolean, controller: AbortController }>()
+
+// Funzione per dividere il testo in chunk
+function chunkText(text: string, chunkSize: number = 1000, overlap: number = 200): string[] {
+  const chunks: string[] = []
+  let start = 0
+  
+  while (start < text.length) {
+    const end = Math.min(start + chunkSize, text.length)
+    let chunk = text.substring(start, end)
+    
+    // Se non è l'ultimo chunk, cerca di tagliare su un punto o spazio
+    if (end < text.length) {
+      const lastPeriod = chunk.lastIndexOf('.')
+      const lastSpace = chunk.lastIndexOf(' ')
+      
+      if (lastPeriod > chunk.length * 0.7) {
+        chunk = chunk.substring(0, lastPeriod + 1)
+        start = start + lastPeriod + 1
+      } else if (lastSpace > chunk.length * 0.7) {
+        chunk = chunk.substring(0, lastSpace + 1)
+        start = start + lastSpace + 1
+      } else {
+        start = end
+      }
+    } else {
+      start = end
+    }
+    
+    chunks.push(chunk.trim())
+    
+    // Overlap
+    if (start < text.length) {
+      start = Math.max(0, start - overlap)
+    }
+  }
+  
+  return chunks.filter(chunk => chunk.length > 0)
+}
 
 // Funzione per estrarre testo da PDF usando pdf2json
 async function extractTextFromPDF(buffer: Buffer): Promise<string> {
@@ -59,7 +100,22 @@ async function extractTextFromPDF(buffer: Buffer): Promise<string> {
           console.log('[UPLOAD] Avviso: PDF potrebbe contenere molte immagini o essere parzialmente scansionato')
         }
         
-        resolve(text.trim())
+        // Check if extracted text is corrupted/gibberish before applying fixes
+        const cleanText = text.trim();
+        const totalChars = cleanText.replace(/\s/g, '').length;
+        const alphabeticChars = (cleanText.match(/[a-zA-Zàèéìíîòóùúäöüß]/g) || []).length;
+        const alphaRatio = totalChars > 0 ? alphabeticChars / totalChars : 0;
+        
+        // If text appears corrupted (very low alphabetic ratio), suggest OCR
+        if (alphaRatio < 0.3 && totalChars > 100) {
+          console.log(`[UPLOAD] Extracted text appears corrupted (${(alphaRatio * 100).toFixed(1)}% alphabetic chars). PDF may need OCR.`);
+          reject(new Error('CORRUPTED_PDF_TEXT'))
+          return;
+        }
+        
+        // Apply character spacing fix to pdf2json text
+        const fixedText = fixCharacterSpacing(cleanText)
+        resolve(fixedText)
       } catch (error) {
         reject(error)
       }
@@ -115,7 +171,110 @@ async function convertPDFToImages(pdfPath: string, outputDir: string): Promise<s
   }
 }
 
-// Funzione per estrarre testo da PDF scansionati usando OCR
+// Funzione per correggere il problema dei caratteri spaziati nell'OCR
+function fixCharacterSpacing(text: string): string {
+  // First, check if text is completely corrupted/gibberish
+  const totalChars = text.replace(/\s/g, '').length;
+  const alphabeticChars = (text.match(/[a-zA-Zàèéìíîòóùúäöüß]/g) || []).length;
+  const alphaRatio = totalChars > 0 ? alphabeticChars / totalChars : 0;
+  
+  // If less than 50% alphabetic characters, probably corrupted - don't try to fix
+  if (alphaRatio < 0.5 && totalChars > 100) {
+    console.log(`[UPLOAD] Text appears corrupted (${(alphaRatio * 100).toFixed(1)}% alphabetic), skipping character spacing fix`);
+    return text.trim();
+  }
+  
+  // Check if this text has character-level spacing (like "c a r a t t e r i")
+  const singleCharSpacePattern = /([a-zA-Zàèéìíîòóùúäöüß])\s+([a-zA-Zàèéìíîòóùúäöüß])\s+([a-zA-Zàèéìíîòóùúäöüß])/;
+  const hasCharacterSpacing = singleCharSpacePattern.test(text);
+  
+  if (!hasCharacterSpacing) {
+    // If no character spacing detected, just clean up basic issues
+    return text
+      .replace(/\s+/g, ' ')
+      .replace(/\s+([.,;:!?()[\]{}])/g, '$1')
+      .replace(/([([{])\s+/g, '$1')
+      .trim();
+  }
+  
+  console.log('[UPLOAD] Character spacing detected, applying advanced fix...');
+  
+  // Strategy: Split on multiple spaces (word boundaries), fix character spacing within each segment
+  
+  // Step 1: Preserve word boundaries by splitting on 2+ spaces
+  const segments = text.split(/\s{2,}/);
+  
+  // Step 2: Fix character spacing within each segment
+  const fixedSegments = segments.map(segment => {
+    if (!segment.trim()) return segment;
+    
+    let fixed = segment;
+    
+    // Apply character spacing fixes within this segment
+    let previousLength;
+    let iterations = 0;
+    const maxIterations = 10;
+    
+    do {
+      previousLength = fixed.length;
+      
+      // Fix single character spacing: "c a r a t t e r i" -> "caratteri"
+      fixed = fixed.replace(/([a-zA-Zàèéìíîòóùúäöüß])\s([a-zA-Zàèéìíîòóùúäöüß])/g, '$1$2');
+      
+      // Fix spaced numbers: "2 0 2 5" -> "2025" 
+      fixed = fixed.replace(/(\d)\s(\d)/g, '$1$2');
+      
+      // Fix mixed alphanumeric: "v 0" -> "v0"
+      fixed = fixed.replace(/([a-zA-Zàèéìíîòóùúäöüß])\s(\d)/g, '$1$2');
+      fixed = fixed.replace(/(\d)\s([a-zA-Zàèéìíîòóùúäöüß])/g, '$1$2');
+      
+      iterations++;
+    } while (fixed.length !== previousLength && iterations < maxIterations);
+    
+    // Handle punctuation within segment
+    fixed = fixed
+      .replace(/([a-zA-Zàèéìíîòóùúäöüß0-9])\s+([.,;:!?()[\]{}])/g, '$1$2')
+      .replace(/([([{])\s+/g, '$1')
+      .replace(/\s+([.,;:!?()[\]{}])/g, '$1');
+    
+    return fixed.trim();
+  });
+  
+  // Step 3: Join segments back with single spaces
+  let result = fixedSegments.filter(segment => segment.length > 0).join(' ');
+  
+  // Step 4: Final cleanup for specific patterns - APOSTROPHES FIRST!
+  result = result
+    // Fix Italian contractions FIRST (before other patterns interfere)
+    .replace(/\b([lL])\s+(['''])\s*([aeiouAEIOU][a-zA-Zàèéìíîòóùúäöüß]*)/g, '$1$2$3')
+    .replace(/\b([dD]ell?|[aA]ll?|[nN]ell?|[sS]ull?)\s+(['''])\s*([aeiouAEIOU][a-zA-Zàèéìíîòóùúäöüß]*)/g, '$1$2$3')
+    .replace(/\b([uU]n)\s+(['''])\s*([aeiouAEIOU][a-zA-Zàèéìíîòóùúäöüß]*)/g, '$1$2$3')
+    .replace(/\b([cC])\s+(['''])\s*(è)/g, '$1$2$3')
+    // General apostrophe fix for any remaining cases
+    .replace(/([a-zA-Zàèéìíîòóùúäöüß])\s+(['''])\s*([a-zA-Zàèéìíîòóùúäöüß])/g, '$1$2$3')
+    // Fix single letter spacing at word start: "C RM" -> "CRM", "G estione" -> "Gestione"  
+    .replace(/\b([A-Z])\s+([a-zA-Zàèéìíîòóùúäöüß]{2,})/g, '$1$2')
+    // Fix acronym spacing: "C RM" -> "CRM", "E RP" -> "ERP"
+    .replace(/\b([A-Z])\s+([A-Z])(?:\s+([A-Z]))?/g, '$1$2$3')
+    // Fix hyphenated words: "E - C ommerce" -> "E-Commerce", "E - mail" -> "E-mail"
+    .replace(/([A-Za-z])\s*-\s*([A-Z])\s*([a-zA-Zàèéìíîòóùúäöüß]*)/g, '$1-$2$3')
+    // Fix specific patterns like ". C" -> ". C" (preserve sentence spacing but fix letter spacing)
+    .replace(/(\.\s+)([A-Z])\s+([a-zA-Zàèéìíîòóùúäöüß]+)/g, '$1$2$3')
+    // Ensure space between number and letter when it makes sense: "25caratteri" -> "25 caratteri"
+    .replace(/(\d+)([a-zA-Zàèéìíîòóùúäöüß]{3,})/g, '$1 $2')
+    // Ensure space between ) and letter: ")Per" -> ") Per"
+    .replace(/([)])([A-Z][a-zA-Zàèéìíîòóùúäöüß]+)/g, '$1 $2')
+    // Fix spacing after colon: ": L" -> ": L" but ":L" -> ": L"
+    .replace(/(:)([A-Z][a-zA-Zàèéìíîòóùúäöüß]+)/g, '$1 $2')
+    // Clean up any remaining multiple spaces
+    .replace(/\s+/g, ' ')
+    .trim();
+  
+  console.log(`[UPLOAD] Character spacing fix: ${text.length} -> ${result.length} characters`);
+  return result;
+}
+
+// Funzione per estrarre testo da PDF scannionati usando OCR
 async function extractTextFromScannedPDF(
   buffer: Buffer, 
   progressCallback?: (progress: { currentPage: number, totalPages: number, status: string }) => void,
@@ -194,6 +353,16 @@ async function extractTextFromScannedPDF(
       lang: 'ita+eng', // Simplified language set
       oem: 1, // LSTM only
       psm: 3, // Fully automatic page segmentation, but no OSD
+      
+      // Additional settings to help with character spacing issues
+      tessedit_char_whitelist: undefined,
+      preserve_interword_spaces: 1,
+      textord_really_old_xheight: 0, // Different line detection for problematic PDFs
+      textord_min_linesize: 1.25, // Minimum line size
+      
+      // Disable some features that might cause spacing issues
+      tessedit_enable_dict_correction: 0, // No dictionary correction in fallback
+      classify_bln_numeric_mode: 1, // Different number handling
     }
     
     let fullText = ''
@@ -227,16 +396,20 @@ async function extractTextFromScannedPDF(
         try {
           pageText = await tesseract.recognize(imagePath, tesseractConfig)
           
+          // Check for character spacing issue (spaces between every character)
+          const hasCharSpacing = /([a-zA-Zàèéìíîòóùúäöüß]\s+){5,}/.test(pageText)
+          
           // Check if result looks garbled (too many non-alphabetic characters)
           const alphaCount = (pageText.match(/[a-zA-Zàèéìíîòóùúäöüß]/g) || []).length
           const totalCount = pageText.replace(/\s/g, '').length
           const alphaRatio = totalCount > 0 ? alphaCount / totalCount : 0
           
-          console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: ratio alfabetico ${(alphaRatio * 100).toFixed(1)}%`)
+          console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: ratio alfabetico ${(alphaRatio * 100).toFixed(1)}%${hasCharSpacing ? ', rilevato spacing caratteri' : ''}`)
           
-          // If less than 30% alphabetic characters, try fallback config
-          if (alphaRatio < 0.3 && totalCount > 50) {
-            console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: testo sembra illeggibile, provo configurazione fallback`)
+          // If less than 30% alphabetic characters OR character spacing detected, try fallback config
+          if ((alphaRatio < 0.3 && totalCount > 50) || hasCharSpacing) {
+            const reason = hasCharSpacing ? 'caratteri spaziati' : 'testo illeggibile'
+            console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: ${reason}, provo configurazione fallback`)
             pageText = await tesseract.recognize(imagePath, fallbackTesseractConfig)
             usedFallback = true
             
@@ -244,7 +417,14 @@ async function extractTextFromScannedPDF(
             const newAlphaCount = (pageText.match(/[a-zA-Zàèéìíîòóùúäöüß]/g) || []).length
             const newTotalCount = pageText.replace(/\s/g, '').length
             const newAlphaRatio = newTotalCount > 0 ? newAlphaCount / newTotalCount : 0
-            console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: fallback ratio alfabetico ${(newAlphaRatio * 100).toFixed(1)}%`)
+            const newHasCharSpacing = /([a-zA-Zàèéìíîòóùúäöüß]\s+){5,}/.test(pageText)
+            console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: fallback ratio alfabetico ${(newAlphaRatio * 100).toFixed(1)}%${newHasCharSpacing ? ', ancora caratteri spaziati' : ''}`)
+            
+            // If still has character spacing after fallback, apply post-processing fix
+            if (newHasCharSpacing) {
+              console.log(`[UPLOAD:${uploadId}] Pagina ${currentPage}: applico correzione spacing caratteri`)
+              pageText = fixCharacterSpacing(pageText)
+            }
           }
           
           consecutiveFailures = 0 // Reset failure counter on success
@@ -579,9 +759,35 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       )
     }
-    // Chunking and vectorization placeholder (replace with your actual logic)
-    const chunked = [extractedText] // TODO: replace with real chunking
-    const vectors: any[] = [] // TODO: replace with real vectorization
+    // Chunking and vectorization - generate embeddings at upload time for better performance
+    console.log('[UPLOAD] Chunking text for embedding generation...')
+    
+    // Use optimized chunking based on content type
+    const chunkingConfig = getOptimalChunkingConfig(extractedText, file.name)
+    const chunked = chunkWithStrategy(extractedText, chunkingConfig, file.name)
+    
+    let vectors: any[] = []
+    
+    try {
+      console.log(`[UPLOAD] Generating embeddings for ${chunked.length} chunks...`)
+      
+      // Generate embeddings for the chunks
+      const fileChunks = [{ fileName: file.name, chunks: chunked }]
+      const chunksWithEmbeddings = await generateChunkEmbeddings(fileChunks)
+      
+      // Extract just the embedding vectors for storage
+      vectors = chunksWithEmbeddings.map(item => ({
+        chunk: item.chunk,
+        embedding: item.embedding,
+        index: item.index
+      }))
+      
+      console.log(`[UPLOAD] Successfully generated ${vectors.length} embeddings`)
+    } catch (error) {
+      console.error('[UPLOAD] Failed to generate embeddings:', error)
+      console.log('[UPLOAD] Continuing without embeddings - they can be generated on-demand during chat')
+      // Continue without embeddings - fallback to on-demand generation
+    }
     // If contextMode is 'context', save to disk
     if (contextMode === 'context' && user !== 'unknown') {
       const username = user.split('@')[0]
@@ -598,7 +804,8 @@ export async function POST(request: NextRequest) {
         fileSize: file.size,
         chunked,
         vectors,
-        uploadedAt: new Date().toISOString()
+        uploadedAt: new Date().toISOString(),
+        embeddingsGenerated: vectors.length > 0
       }, null, 2), 'utf-8')
       return NextResponse.json({
         success: true,
@@ -608,7 +815,10 @@ export async function POST(request: NextRequest) {
         characterCount: extractedText.length,
         contextSaved: true,
         contextPath: outPath,
-        extractedText: extractedText // Return full text for context files too
+        extractedText: extractedText, // Return full text for context files too
+        chunksCount: chunked.length,
+        embeddingsCount: vectors.length,
+        embeddingsGenerated: vectors.length > 0
       })
     }
     // For session, return full text (not just preview)
@@ -619,7 +829,10 @@ export async function POST(request: NextRequest) {
       fileType: file.type,
       characterCount: extractedText.length,
       contextSaved: false,
-      extractedText: extractedText // Return full text for session files
+      extractedText: extractedText, // Return full text for session files
+      chunksCount: chunked.length,
+      embeddingsCount: vectors.length,
+      embeddingsGenerated: vectors.length > 0
     })
   } catch (error) {
     // Improved error handling: always return JSON

@@ -24,9 +24,14 @@ export async function POST(request: NextRequest) {
     }
 
     // Get expected password from environment
+    const envKey = emailToEnvKey(email)
     const expectedPassword = getUserPassword(email)
     
+    // Debug logging
+    console.log('Login attempt:', { email, envKey, hasPassword: !!expectedPassword })
+    
     if (!expectedPassword) {
+      console.log('No password found for key:', envKey)
       return NextResponse.json(
         { error: 'Invalid credentials' },
         { status: 401 }

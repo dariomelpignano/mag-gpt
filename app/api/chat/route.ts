@@ -3,6 +3,8 @@ import { ChatOpenAI } from '@langchain/openai'
 import { PromptTemplate } from '@langchain/core/prompts'
 import { generateChunkEmbeddings, findRelevantChunks } from '@/lib/embeddings'
 import { logInteraction } from '@/lib/logger'
+import { getOptimalChunkingConfig, getOptimalRetrievalCount } from '@/lib/chunking-config'
+import { chunkWithStrategy } from '@/lib/optimized-chunking'
 
 // Funzione per dividere il testo in chunk
 function chunkText(text: string, chunkSize: number = 1000, overlap: number = 200): string[] {
@@ -145,36 +147,66 @@ export async function POST(request: NextRequest) {
     if (uploadedFiles && uploadedFiles.length > 0) {
       console.log('[RAG] Processing', uploadedFiles.length, 'files for retrieval with embeddings')
       
-      // Dividi ogni file in chunk
-      const fileChunks = uploadedFiles.map((file: any) => ({
-        fileName: file.name,
-        chunks: chunkText(file.content, 800, 150) // Chunk più piccoli per precisione
-      }))
+      // Calculate optimal retrieval count before try block for use in fallback
+      const firstFile = uploadedFiles[0]
+      const chunkingConfig = getOptimalChunkingConfig(firstFile?.content || '', firstFile?.name || '')
+      const optimalRetrievalCount = getOptimalRetrievalCount(userQuery, chunkingConfig)
       
       try {
-        // Check cache for embeddings
-        const { key: cacheKey, contentHash } = getCacheKey(fileChunks)
-        const cacheEntry = embeddingsCache.get(cacheKey)
-        let chunksWithEmbeddings
+        let chunksWithEmbeddings: any[] = []
+        let hasPreGeneratedEmbeddings = false
         
-        if (cacheEntry && isCacheValid(cacheEntry, contentHash)) {
-          console.log('[RAG] Using cached embeddings')
-          chunksWithEmbeddings = cacheEntry.embeddings
-        } else {
-          console.log('[RAG] Generating new embeddings...')
-          chunksWithEmbeddings = await generateChunkEmbeddings(fileChunks)
-          
-          // Update cache with new embeddings
-          embeddingsCache.set(cacheKey, {
-            embeddings: chunksWithEmbeddings,
-            timestamp: Date.now(),
-            contentHash: contentHash
-          })
-          console.log('[RAG] Embeddings cached for future use')
+        // Check if files have pre-generated embeddings from upload
+        for (const file of uploadedFiles) {
+          if (file.vectors && file.vectors.length > 0) {
+            console.log(`[RAG] Using pre-generated embeddings for ${file.name} (${file.vectors.length} chunks)`)
+            
+            // Convert stored vectors back to the format expected by findRelevantChunks
+            const fileEmbeddings = file.vectors.map((item: any) => ({
+              chunk: item.chunk,
+              fileName: file.name,
+              embedding: item.embedding,
+              index: item.index
+            }))
+            
+            chunksWithEmbeddings.push(...fileEmbeddings)
+            hasPreGeneratedEmbeddings = true
+          }
         }
         
-        // Recupera i chunk più rilevanti usando similarità vettoriale
-        const relevantChunks = await findRelevantChunks(userQuery, chunksWithEmbeddings, 4)
+        // If no pre-generated embeddings, fall back to on-demand generation
+        if (!hasPreGeneratedEmbeddings) {
+          console.log('[RAG] No pre-generated embeddings found, generating on-demand...')
+          
+          // Dividi ogni file in chunk
+          const fileChunks = uploadedFiles.map((file: any) => ({
+            fileName: file.name,
+            chunks: chunkText(file.content, 800, 150) // Chunk più piccoli per precisione
+          }))
+          
+          // Check cache for embeddings
+          const { key: cacheKey, contentHash } = getCacheKey(fileChunks)
+          const cacheEntry = embeddingsCache.get(cacheKey)
+          
+          if (cacheEntry && isCacheValid(cacheEntry, contentHash)) {
+            console.log('[RAG] Using cached embeddings')
+            chunksWithEmbeddings = cacheEntry.embeddings
+          } else {
+            console.log('[RAG] Generating new embeddings...')
+            chunksWithEmbeddings = await generateChunkEmbeddings(fileChunks)
+            
+            // Update cache with new embeddings
+            embeddingsCache.set(cacheKey, {
+              embeddings: chunksWithEmbeddings,
+              timestamp: Date.now(),
+              contentHash: contentHash
+            })
+            console.log('[RAG] Embeddings cached for future use')
+          }
+        }
+        
+        // Recupera i chunk più rilevanti usando similarità vettoriale with dynamic count
+        const relevantChunks = await findRelevantChunks(userQuery, chunksWithEmbeddings, optimalRetrievalCount)
         
         if (relevantChunks.length > 0) {
           context = `\n\nRelevant context from uploaded files:\n${relevantChunks.join('\n\n---\n\n')}`
@@ -188,15 +220,25 @@ export async function POST(request: NextRequest) {
         
         // Fallback to simple keyword matching if embeddings fail
         const allChunks: { chunk: string, fileName: string }[] = []
-        for (const file of fileChunks) {
-          for (const chunk of file.chunks) {
-            allChunks.push({ chunk, fileName: file.fileName })
+        for (const file of uploadedFiles) {
+          // If file has chunks from vectors, use those
+          if (file.vectors && file.vectors.length > 0) {
+            for (const vectorItem of file.vectors) {
+              allChunks.push({ chunk: vectorItem.chunk, fileName: file.name })
+            }
+          } else {
+            // Otherwise chunk the content on the fly using optimized chunking
+            const fileConfig = getOptimalChunkingConfig(file.content, file.name)
+            const chunks = chunkWithStrategy(file.content, fileConfig, file.name)
+            for (const chunk of chunks) {
+              allChunks.push({ chunk, fileName: file.name })
+            }
           }
         }
         
-        // Simple fallback: take first few chunks
+        // Simple fallback: take first few chunks using dynamic count
         const fallbackChunks = allChunks
-          .slice(0, 4)
+          .slice(0, optimalRetrievalCount)
           .map(item => `[${item.fileName}]\n${item.chunk}`)
         
         if (fallbackChunks.length > 0) {
