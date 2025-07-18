@@ -292,16 +292,41 @@ Please provide a clear, accurate, and helpful response. If the context doesn't c
       async start(controller) {
         try {
           for await (const chunk of stream) {
+            // Check if the request was aborted
+            if (request.signal?.aborted) {
+              console.log('[CHAT] Request aborted, stopping stream')
+              controller.close()
+              return
+            }
+            
             const text = chunk.content
             if (text) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: text })}\n\n`))
+              // Check if controller is still open before enqueueing
+              try {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: text })}\n\n`))
+              } catch (controllerError) {
+                // Controller might be closed if client disconnected
+                console.log('[CHAT] Controller closed, stopping stream')
+                return
+              }
             }
           }
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-          controller.close()
+          
+          // Only send [DONE] if controller is still open
+          try {
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+            controller.close()
+          } catch (controllerError) {
+            console.log('[CHAT] Controller already closed')
+          }
         } catch (error) {
           console.error('[CHAT] Streaming error:', error)
-          controller.error(error)
+          // Only try to error if controller is still open
+          try {
+            controller.error(error)
+          } catch (controllerError) {
+            console.log('[CHAT] Could not send error, controller closed')
+          }
         }
       }
     })

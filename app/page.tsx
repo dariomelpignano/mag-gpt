@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
-import { Send, Bot, User, Trash2, Copy, Check, Paperclip, ChevronDown, ChevronUp, FileText, LogOut, Settings, RefreshCw } from "lucide-react"
+import { Send, Bot, User, Trash2, Copy, Check, Paperclip, ChevronDown, ChevronUp, FileText, LogOut, Settings, RefreshCw, Square } from "lucide-react"
 import { FileUpload, UploadedFile } from "@/components/file-upload"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
@@ -19,20 +19,25 @@ interface UploadedFileWithPersistent extends UploadedFile {
   persistent?: boolean
 }
 
-// Utility to merge files by name, type, and content (avoiding duplicates)
-function mergeFiles(contextFiles: UploadedFileWithPersistent[], sessionFiles: UploadedFileWithPersistent[]): UploadedFileWithPersistent[] {
-  const seen = new Set<string>()
-  const merged: UploadedFileWithPersistent[] = []
-  for (const file of [...contextFiles, ...sessionFiles]) {
-    // Use a composite key to avoid duplicates
-    const key = `${file.name}|${file.type}|${file.content.length}`
-    if (!seen.has(key)) {
-      seen.add(key)
-      merged.push(file)
+// Helper function to merge persistent and session files without duplicates
+function mergeFiles(contextFiles: UploadedFileWithPersistent[], sessionFiles: UploadedFile[]): UploadedFile[] {
+  const merged = [...contextFiles]
+  
+  // Add session files that aren't already in context
+  for (const sessionFile of sessionFiles) {
+    const isDuplicate = contextFiles.some(contextFile => 
+      contextFile.name === sessionFile.name && 
+      Math.abs(contextFile.size - sessionFile.size) < 1000 // Allow small size differences
+    )
+    if (!isDuplicate) {
+      merged.push(sessionFile)
     }
   }
+  
   return merged
 }
+
+
 
 export default function ChatApp() {
   const { messages, input, handleInputChange, setMessages } = useChat()
@@ -57,11 +62,16 @@ export default function ChatApp() {
       const response = await fetch('/api/models')
       if (response.ok) {
         const data = await response.json()
-        setAvailableModels(data.models || [])
+        // Additional client-side deduplication to prevent any duplicates
+        const rawModels = (data.models || []) as string[]
+        const uniqueModels = [...new Set(rawModels)]
+        console.log('[PAGE] Models received from API:', data.models)
+        console.log('[PAGE] Unique models after deduplication:', uniqueModels)
+        setAvailableModels(uniqueModels)
         
         // Only set default model if no model is currently selected
         if (!selectedModel) {
-          setSelectedModel(data.defaultModel || data.models[0] || "")
+          setSelectedModel(data.defaultModel || uniqueModels[0] || "")
         }
         
         if (data.fallback) {
@@ -72,8 +82,8 @@ export default function ChatApp() {
       }
     } catch (error) {
       console.error('Failed to get available models:', error)
-      // Fallback models if fetch fails
-      const fallbackModels = ['google/gemma-3-27b', 'qwen/qwen3-235b-a22b:2']
+      // Fallback models if fetch fails (updated to match LM Studio IDs)
+      const fallbackModels = ['google/gemma-3-27b', 'qwen/qwen3-235b-a22b']
       setAvailableModels(fallbackModels)
       if (!selectedModel) {
         setSelectedModel(fallbackModels[0])
@@ -208,6 +218,10 @@ export default function ChatApp() {
   const [showUploadPanel, setShowUploadPanel] = useState(true)
   const [originalInput, setOriginalInput] = useState("")
   const [isStreaming, setIsStreaming] = useState(false)
+  
+  // Add AbortController for request cancellation
+  const abortControllerRef = useRef<AbortController | null>(null)
+  
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -230,6 +244,20 @@ export default function ChatApp() {
       window.location.reload() // Reload to trigger auth check
     } catch (error) {
       console.error('Logout failed:', error)
+    }
+  }
+
+  // Function to stop streaming
+  const stopStreaming = () => {
+    if (abortControllerRef.current && !abortControllerRef.current.signal.aborted) {
+      console.log('[PAGE] Stopping stream...')
+      try {
+        abortControllerRef.current.abort()
+      } catch (error) {
+        console.log('[PAGE] Abort signal already sent')
+      }
+      abortControllerRef.current = null
+      setIsStreaming(false)
     }
   }
 
@@ -280,12 +308,15 @@ export default function ChatApp() {
 
   const onSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
-    if (input.trim()) {
+    if (input.trim() && !isStreaming) {
       const userMessage = input.trim()
       setOriginalInput(userMessage)
       
       // Clear the input first
       handleInputChange({ target: { value: "" } } as React.ChangeEvent<HTMLInputElement>)
+      
+      // Create new AbortController for this request
+      abortControllerRef.current = new AbortController()
       
       // Set streaming state immediately
       setIsStreaming(true)
@@ -310,6 +341,7 @@ export default function ChatApp() {
             uploadedFiles: uploadedFiles,
             model: selectedModel
           }),
+          signal: abortControllerRef.current.signal
         })
 
         if (!response.ok) {
@@ -332,54 +364,84 @@ export default function ChatApp() {
         setMessages(prev => [...prev, assistantMsg])
 
         if (reader) {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
+          try {
+            while (true) {
+              const { done, value } = await reader.read()
+              if (done) break
 
-            const chunk = decoder.decode(value, { stream: true })
-            const lines = chunk.split('\n')
+              const chunk = decoder.decode(value, { stream: true })
+              const lines = chunk.split('\n')
 
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6)
-                if (data === '[DONE]') {
-                  break
-                }
-                
-                try {
-                  const parsed = JSON.parse(data)
-                  if (parsed.content) {
-                    assistantMessage += parsed.content
-                    
-                    // Update the last message (assistant message)
-                    setMessages(prev => {
-                      const newMessages = [...prev]
-                      if (newMessages.length > 0 && newMessages[newMessages.length - 1].id === assistantId) {
-                        newMessages[newMessages.length - 1] = {
-                          ...newMessages[newMessages.length - 1],
-                          content: assistantMessage
-                        }
-                      }
-                      return newMessages
-                    })
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const data = line.slice(6)
+                  if (data === '[DONE]') {
+                    break
                   }
-                } catch (e) {
-                  // Ignore parsing errors
+                  
+                  try {
+                    const parsed = JSON.parse(data)
+                    if (parsed.content) {
+                      assistantMessage += parsed.content
+                      
+                      // Update the last message (assistant message)
+                      setMessages(prev => {
+                        const newMessages = [...prev]
+                        if (newMessages.length > 0 && newMessages[newMessages.length - 1].id === assistantId) {
+                          newMessages[newMessages.length - 1] = {
+                            ...newMessages[newMessages.length - 1],
+                            content: assistantMessage
+                          }
+                        }
+                        return newMessages
+                      })
+                    }
+                  } catch (e) {
+                    // Ignore parsing errors
+                  }
                 }
               }
             }
+          } catch (readerError: any) {
+            // Handle stream reading errors (including AbortError)
+            if (readerError.name === 'AbortError') {
+              console.log('[PAGE] Stream reading aborted by user')
+            } else {
+              console.error('[PAGE] Stream reading error:', readerError)
+            }
+          } finally {
+            // Always try to cancel the reader and close the stream
+            try {
+              await reader.cancel()
+            } catch (e) {
+              // Ignore cleanup errors
+            }
           }
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error('Error getting AI response:', error)
-        const errorMsg = {
-          id: (Date.now() + 2).toString(),
-          role: 'assistant' as const,
-          content: 'Sorry, I encountered an error while processing your request. Please try again.'
+        
+        // Check if it was aborted by user
+        if (error.name === 'AbortError') {
+          console.log('[PAGE] Request was aborted by user')
+          // Add a message indicating the response was stopped
+          const stopMsg = {
+            id: (Date.now() + 2).toString(),
+            role: 'assistant' as const,
+            content: 'Response interrupted by user.'
+          }
+          setMessages(prev => [...prev, stopMsg])
+        } else {
+          const errorMsg = {
+            id: (Date.now() + 2).toString(),
+            role: 'assistant' as const,
+            content: 'Sorry, I encountered an error while processing your request. Please try again.'
+          }
+          setMessages(prev => [...prev, errorMsg])
         }
-        setMessages(prev => [...prev, errorMsg])
       } finally {
         setIsStreaming(false)
+        abortControllerRef.current = null
       }
     }
   }
@@ -679,7 +741,7 @@ export default function ChatApp() {
                   </button>
                 </div>
                 <FileUpload 
-                  files={uploadedFiles} 
+                  files={uploadedFiles.filter(file => !file.name?.startsWith('[BASE]'))} 
                   onFilesChange={(updater) => {
                     // Only handle session files here, context files are handled via context refresh
                     setUploadedFiles((prev) => {
@@ -729,15 +791,38 @@ export default function ChatApp() {
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => setShowFileUpload(!showFileUpload)}
+              onClick={() => {
+                const newShowFileUpload = !showFileUpload
+                setShowFileUpload(newShowFileUpload)
+                // When showing file upload, always expand the panel
+                if (newShowFileUpload) {
+                  setShowUploadPanel(true)
+                }
+              }}
               disabled={isStreaming}
               className="px-3 py-3"
             >
               <Paperclip className="w-4 h-4" />
             </Button>
-            <Button type="submit" disabled={isStreaming || !input.trim()} className="px-6 py-3">
-              <Send className="w-4 h-4" />
-            </Button>
+            {isStreaming ? (
+              <Button 
+                type="button" 
+                onClick={stopStreaming}
+                className="px-6 py-3"
+                title="Stop generating response"
+              >
+                <Square className="w-4 h-4 fill-current" />
+              </Button>
+            ) : (
+              <Button 
+                type="submit" 
+                disabled={!input.trim()} 
+                className="px-6 py-3"
+                title="Send message"
+              >
+                <Send className="w-4 h-4" />
+              </Button>
+            )}
           </form>
           <div className="flex items-center justify-between mt-2">
             <p className="text-xs text-gray-500 dark:text-gray-400">
